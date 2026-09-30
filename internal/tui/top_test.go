@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/shadowdex/lmon/internal/pricing"
 	"github.com/shadowdex/lmon/internal/proxy"
 	"github.com/shadowdex/lmon/internal/usage"
 )
@@ -142,7 +143,7 @@ func TestPollReadsLogAndPrunesOldEvents(t *testing.T) {
 	lg.Write(ev(time.Minute, "anthropic", "fresh", 200, 1, usage.Usage{}))
 	lg.Close()
 
-	m := New(p, 15*time.Minute)
+	m := New(p, 15*time.Minute, nil)
 	m.now = func() time.Time { return t0 }
 	m.poll()
 	if len(m.events) != 1 || m.events[0].Model != "fresh" {
@@ -155,7 +156,7 @@ func TestNewPicksSmallestWindowAtLeastRequested(t *testing.T) {
 		in   time.Duration
 		want int
 	}{{time.Minute, 0}, {15 * time.Minute, 1}, {20 * time.Minute, 2}, {999 * time.Hour, 3}} {
-		if m := New(filepath.Join(t.TempDir(), "x"), c.in); m.window != c.want {
+		if m := New(filepath.Join(t.TempDir(), "x"), c.in, nil); m.window != c.want {
 			t.Errorf("window(%s) = %d, want %d", c.in, m.window, c.want)
 		}
 	}
@@ -171,3 +172,79 @@ func TestHumanAndFmt(t *testing.T) {
 }
 
 func lipglossWidth(s string) int { return len([]rune(s)) }
+
+func priced(t *testing.T) *pricing.Table {
+	t.Helper()
+	tb, err := pricing.Reduce([]byte(`{"claude-x":{"litellm_provider":"anthropic","mode":"chat","input_cost_per_token":1e-6,"output_cost_per_token":2e-6}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tb
+}
+
+func TestCostColumnSummaryAndBurnRate(t *testing.T) {
+	m := testModel(
+		ev(1*time.Minute, "anthropic", "claude-x", 200, 100, usage.Usage{InputTokens: 1_000_000}), // $1.00
+		ev(3*time.Minute, "anthropic", "claude-x", 200, 100, usage.Usage{InputTokens: 1_000_000}), // $1.00
+	)
+	m.prices = priced(t)
+	out := plain(m.Render(140))
+	for _, want := range []string{"COST", "cost $2.00", "$40.00/h", "$2.00"} { // 2.00 over a 3 minute span = 40/h
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "$2.00*") {
+		t.Error("fully priced data must not carry the lower-bound marker")
+	}
+}
+
+func TestUnpricedCallsMarkCostAsLowerBound(t *testing.T) {
+	m := testModel(
+		ev(time.Minute, "anthropic", "claude-x", 200, 100, usage.Usage{InputTokens: 1_000_000}),
+		ev(time.Minute, "anthropic", "claude-unknown", 200, 100, usage.Usage{InputTokens: 5}),
+		ev(time.Minute, "anthropic", "claude-x", 429, 100, usage.Usage{}), // failed: free, must not trigger the marker by itself
+	)
+	m.prices = priced(t)
+	out := plain(m.Render(140))
+	if !strings.Contains(out, "cost $1.00*") {
+		t.Errorf("expected lower-bound marker in summary:\n%s", out)
+	}
+	if !strings.Contains(out, "n/a") {
+		t.Errorf("unknown model row should show n/a:\n%s", out)
+	}
+}
+
+func TestNoPriceTableMeansNoCostColumnOrSummary(t *testing.T) {
+	m := testModel(ev(time.Minute, "anthropic", "claude-x", 200, 100, usage.Usage{InputTokens: 10}))
+	out := plain(m.Render(140))
+	if strings.Contains(out, "COST") || strings.Contains(out, "cost $") {
+		t.Errorf("cost shown without a table:\n%s", out)
+	}
+}
+
+func TestBurnRateSpanClamping(t *testing.T) {
+	// under a minute of data extrapolates from one minute, not from seconds
+	if got := burnRate(1, 5*time.Second, time.Hour); got != "$60.00/h" {
+		t.Errorf("short span: %s", got)
+	}
+	// span can't exceed the window
+	if got := burnRate(10, 48*time.Hour, 24*time.Hour); got != "$0.417/h" {
+		t.Errorf("long span: %s", got)
+	}
+	if got := burnRate(6, 30*time.Minute, time.Hour); got != "$12.00/h" {
+		t.Errorf("normal: %s", got)
+	}
+}
+
+func TestCostColumnSurvivesNarrowerThanP50(t *testing.T) {
+	m := testModel(ev(time.Minute, "anthropic", "claude-x", 200, 100, usage.Usage{InputTokens: 1_000_000}))
+	m.prices = priced(t)
+	out := plain(m.table(m.events, t0, 15*time.Minute, 62))
+	if !strings.Contains(out, "COST") {
+		t.Errorf("COST should outlast P50/IN/ERR/OUT when space is tight:\n%s", out)
+	}
+	if strings.Contains(out, "P50") {
+		t.Errorf("P50 should have been dropped before COST:\n%s", out)
+	}
+}

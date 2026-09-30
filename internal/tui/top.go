@@ -10,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/shadowdex/lmon/internal/pricing"
 	"github.com/shadowdex/lmon/internal/proxy"
 	"github.com/shadowdex/lmon/internal/stats"
 )
@@ -39,6 +40,7 @@ type Model struct {
 	tailer *stats.Tailer
 	events []proxy.Event
 	now    func() time.Time
+	prices *pricing.Table // nil = no cost column
 
 	window int // index into Windows
 	sortBy int // index into sortKeys
@@ -47,9 +49,10 @@ type Model struct {
 	err    error
 }
 
-// New creates the model and loads existing history immediately.
-func New(logPath string, window time.Duration) *Model {
-	m := &Model{tailer: &stats.Tailer{Path: logPath}, now: time.Now}
+// New creates the model and loads existing history immediately. prices may be
+// nil, in which case costs are not shown.
+func New(logPath string, window time.Duration, prices *pricing.Table) *Model {
+	m := &Model{tailer: &stats.Tailer{Path: logPath}, now: time.Now, prices: prices}
 	m.window = len(Windows) - 1
 	for i, w := range Windows {
 		if w >= window {
@@ -158,16 +161,26 @@ func (m *Model) Render(width int) string {
 		return b.String()
 	}
 
-	b.WriteString(summary(in, win) + "\n")
+	b.WriteString(summary(in, now, win, m.prices) + "\n")
 	b.WriteString(dim.Render("activity ") + cyan.Render(sparkline(bucketCounts(in, now, win, 40))) + "\n\n")
 	b.WriteString(m.table(in, now, win, width))
 	return b.String()
 }
 
-func summary(in []proxy.Event, win time.Duration) string {
-	var calls, errs, inTok, outTok, cacheR, totIn int
+func summary(in []proxy.Event, now time.Time, win time.Duration, prices *pricing.Table) string {
+	var calls, errs, inTok, outTok, cacheR, totIn, unpriced int
 	var lat []float64
+	var cost float64
+	first := now
 	for _, e := range in {
+		if usd, priced, billable := stats.PriceEvent(prices, e); priced {
+			cost += usd
+		} else if billable {
+			unpriced++
+		}
+		if e.Time.Before(first) {
+			first = e.Time
+		}
 		calls++
 		if e.Status >= 400 {
 			errs++
@@ -187,8 +200,28 @@ func summary(in []proxy.Event, win time.Duration) string {
 	if errs > 0 {
 		parts = append(parts, red.Render(fmt.Sprintf("%d errors", errs)))
 	}
+	if prices != nil && (cost > 0 || unpriced == 0) {
+		mark := ""
+		if unpriced > 0 {
+			mark = "*" // some calls couldn't be priced: a lower bound
+		}
+		parts = append(parts, bold.Render("cost "+pricing.FormatUSD(cost)+mark)+dim.Render(" ("+burnRate(cost, now.Sub(first), win)+")"))
+	}
 	parts = append(parts, fmt.Sprintf("p50 %s  p95 %s", fmtMs(stats.Percentile(lat, 50)), fmtMs(stats.Percentile(lat, 95))))
 	return strings.Join(parts, dim.Render("  ·  "))
+}
+
+// burnRate projects cost per hour from the span the data actually covers, so a
+// 24h window with ten minutes of traffic isn't diluted by 23h50m of silence.
+// The span is at least one minute (to avoid wild extrapolation from one call).
+func burnRate(cost float64, span, win time.Duration) string {
+	if span < time.Minute {
+		span = time.Minute
+	}
+	if span > win {
+		span = win
+	}
+	return pricing.FormatUSD(cost/span.Hours()) + "/h"
 }
 
 type col struct {
@@ -200,30 +233,50 @@ type col struct {
 }
 
 func (m *Model) table(in []proxy.Event, now time.Time, win time.Duration, width int) string {
-	rows := buildRows(in, now, win)
+	rows := buildRows(in, now, win, m.prices)
 	sortRows(rows, sortKeys[m.sortBy])
 
 	cols := []col{
 		{"PROVIDER", 10, true, 2, func(r rowData, w int) string { return pad(r.Provider, w, true) }},
 		{"MODEL", 0, true, 0, func(r rowData, w int) string { return pad(ellipsize(r.Model, w), w, true) }},
 		{"CALLS", 6, false, 0, func(r rowData, w int) string { return pad(fmt.Sprint(r.Calls), w, false) }},
-		{"ERR", 4, false, 5, func(r rowData, w int) string {
+		{"ERR", 4, false, 6, func(r rowData, w int) string {
 			s := pad(fmt.Sprint(r.Errors), w, false)
 			if r.Errors > 0 {
 				return red.Render(s)
 			}
 			return dim.Render(s)
 		}},
-		{"IN", 7, false, 4, func(r rowData, w int) string { return pad(human(r.Input+r.CacheRead+r.CacheWrite), w, false) }},
-		{"OUT", 7, false, 6, func(r rowData, w int) string { return pad(human(r.Output), w, false) }},
-		{"CACHE-R", 8, false, 7, func(r rowData, w int) string { return pad(human(r.CacheRead), w, false) }},
+		{"IN", 7, false, 5, func(r rowData, w int) string { return pad(human(r.Input+r.CacheRead+r.CacheWrite), w, false) }},
+		{"OUT", 7, false, 7, func(r rowData, w int) string { return pad(human(r.Output), w, false) }},
+		{"CACHE-R", 8, false, 8, func(r rowData, w int) string { return pad(human(r.CacheRead), w, false) }},
 		{"HIT%", 5, false, 0, func(r rowData, w int) string {
 			return hitStyledW(r.CacheRead, r.Input+r.CacheRead+r.CacheWrite, w)
 		}},
-		{"P50", 7, false, 3, func(r rowData, w int) string { return pad(fmtMs(r.P50TotalMs), w, false) }},
+		{"COST", 9, false, 3, func(r rowData, w int) string {
+			if m.prices == nil {
+				return pad("", w, false)
+			}
+			l := r.CostLabel()
+			s := pad(l, w, false)
+			if l == "n/a" || l == "-" {
+				return dim.Render(s)
+			}
+			return s
+		}},
+		{"P50", 7, false, 4, func(r rowData, w int) string { return pad(fmtMs(r.P50TotalMs), w, false) }},
 		{"P95", 7, false, 0, func(r rowData, w int) string { return pad(fmtMs(r.P95TotalMs), w, false) }},
-		{"TTFB", 7, false, 8, func(r rowData, w int) string { return pad(fmtMs(r.AvgTTFBMs), w, false) }},
-		{"TREND", trendCells, true, 9, func(r rowData, w int) string { return cyan.Render(pad(sparkline(r.trend), w, true)) }},
+		{"TTFB", 7, false, 9, func(r rowData, w int) string { return pad(fmtMs(r.AvgTTFBMs), w, false) }},
+		{"TREND", trendCells, true, 10, func(r rowData, w int) string { return cyan.Render(pad(sparkline(r.trend), w, true)) }},
+	}
+
+	if m.prices == nil {
+		for i, c := range cols {
+			if c.title == "COST" {
+				cols = append(cols[:i], cols[i+1:]...)
+				break
+			}
+		}
 	}
 
 	const gap = 2
@@ -281,8 +334,8 @@ func (m *Model) table(in []proxy.Event, now time.Time, win time.Duration, width 
 	return b.String()
 }
 
-func buildRows(in []proxy.Event, now time.Time, win time.Duration) []rowData {
-	agg := stats.Aggregate(in)
+func buildRows(in []proxy.Event, now time.Time, win time.Duration, prices *pricing.Table) []rowData {
+	agg := stats.AggregateWithPrices(in, prices)
 	type key struct{ p, m string }
 	byKey := map[key][]proxy.Event{}
 	for _, e := range in {

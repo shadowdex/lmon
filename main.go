@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/x/term"
 
 	"github.com/shadowdex/lmon/internal/geoip"
+	"github.com/shadowdex/lmon/internal/pricing"
 	"github.com/shadowdex/lmon/internal/probe"
 	"github.com/shadowdex/lmon/internal/proxy"
 	"github.com/shadowdex/lmon/internal/stats"
@@ -37,6 +38,8 @@ Usage:
   lmon top [--window 15m] [--log PATH]    live terminal view (keys: w window, s sort, p pause, q quit)
   lmon probe <host> [--geoip FILE] [--json]
                                           DNS, geo and connection timing for an endpoint
+  lmon prices update                      download model prices (enables cost estimates)
+  lmon prices show <provider> <model>     show the rates lmon would use for a model
   lmon geoip update                       download the free DB-IP city database (~/.lmon)
   lmon geoip path                         print the database path in use
   lmon version
@@ -65,6 +68,8 @@ func main() {
 		err = runTop(args)
 	case "geoip":
 		err = runGeoIP(args)
+	case "prices":
+		err = runPrices(args)
 	case "version", "--version", "-v":
 		fmt.Printf("lmon %s (%s)\n", version, commit)
 	case "help", "--help", "-h":
@@ -133,7 +138,8 @@ func runStats(args []string) error {
 	if err != nil {
 		return err
 	}
-	rows := stats.Aggregate(events)
+	tbl := loadPrices()
+	rows := stats.AggregateWithPrices(events, tbl)
 	if *asJSON {
 		return json.NewEncoder(os.Stdout).Encode(rows)
 	}
@@ -142,13 +148,50 @@ func runStats(args []string) error {
 		return nil
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "PROVIDER\tMODEL\tCALLS\tERR\tINPUT\tOUTPUT\tCACHE-R\tCACHE-W\tHIT%\tAVG\tP50\tP95\tTTFB")
-	for _, r := range rows {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%.0f%%\t%.0fms\t%.0fms\t%.0fms\t%.0fms\n",
-			r.Provider, r.Model, r.Calls, r.Errors, r.Input, r.Output, r.CacheRead, r.CacheWrite,
-			r.CacheHitRate*100, r.AvgTotalMs, r.P50TotalMs, r.P95TotalMs, r.AvgTTFBMs)
+	costHdr := ""
+	if tbl != nil {
+		costHdr = "\tCOST"
 	}
-	return tw.Flush()
+	fmt.Fprintln(tw, "PROVIDER\tMODEL\tCALLS\tERR\tINPUT\tOUTPUT\tCACHE-R\tCACHE-W\tHIT%\tAVG\tP50\tP95\tTTFB"+costHdr)
+	var total float64
+	var anyUnpriced bool
+	for _, r := range rows {
+		total += r.CostUSD
+		anyUnpriced = anyUnpriced || r.UnpricedCalls > 0
+		cost := ""
+		if tbl != nil {
+			cost = "\t" + r.CostLabel()
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%.0f%%\t%.0fms\t%.0fms\t%.0fms\t%.0fms%s\n",
+			r.Provider, r.Model, r.Calls, r.Errors, r.Input, r.Output, r.CacheRead, r.CacheWrite,
+			r.CacheHitRate*100, r.AvgTotalMs, r.P50TotalMs, r.P95TotalMs, r.AvgTTFBMs, cost)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	switch {
+	case tbl == nil:
+		fmt.Fprintln(os.Stderr, "\ncost estimates are off: run `lmon prices update` to enable them")
+	case anyUnpriced:
+		fmt.Printf("\nestimated total %s* (* some calls could not be priced, so this is a lower bound)\n", pricing.FormatUSD(total))
+	default:
+		fmt.Printf("\nestimated total %s\n", pricing.FormatUSD(total))
+	}
+	return nil
+}
+
+// loadPrices returns the local price table, or nil if there isn't one. A
+// corrupt table is reported but never stops stats/top from working.
+func loadPrices() *pricing.Table {
+	tbl, err := pricing.Load(pricing.DefaultPath())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "lmon: prices:", err)
+		return nil
+	}
+	if tbl != nil && tbl.Age() > 45*24*time.Hour {
+		fmt.Fprintf(os.Stderr, "lmon: note: price table is %d days old; `lmon prices update` refreshes it\n", int(tbl.Age().Hours()/24))
+	}
+	return tbl
 }
 
 func runProbe(args []string) error {
@@ -246,6 +289,51 @@ func runTop(args []string) error {
 	if !term.IsTerminal(os.Stdout.Fd()) {
 		return fmt.Errorf("top needs an interactive terminal; use `lmon stats` for piped output")
 	}
-	_, err := tea.NewProgram(tui.New(*logPath, *window)).Run()
+	_, err := tea.NewProgram(tui.New(*logPath, *window, loadPrices())).Run()
 	return err
 }
+
+func runPrices(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: lmon prices update | show <provider> <model>")
+	}
+	switch args[0] {
+	case "update":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		_, err := pricing.Update(ctx, pricing.UpdateOptions{Out: os.Stderr})
+		return err
+	case "show":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: lmon prices show <provider> <model>")
+		}
+		tbl, err := pricing.Load(pricing.DefaultPath())
+		if err != nil {
+			return err
+		}
+		if tbl == nil {
+			return fmt.Errorf("no price table yet; run `lmon prices update`")
+		}
+		key, e, ok := tbl.Lookup(args[1], args[2])
+		if !ok {
+			msg := fmt.Sprintf("no price for %s model %q", args[1], args[2])
+			if sug := tbl.Suggest(args[1], args[2], 8); len(sug) > 0 {
+				msg += "; similar: " + strings.Join(sug, ", ")
+			}
+			return fmt.Errorf("%s", msg)
+		}
+		fmt.Printf("%s (%s), USD per million tokens, table updated %s\n", key, e.Provider, tbl.Updated.Format("2006-01-02"))
+		printRates := func(label string, r pricing.Rates) {
+			fmt.Printf("  %-12s input %-8s output %-8s cache-read %-8s cache-write %-8s cache-write-1h %s\n", label,
+				perM(r.Input), perM(r.Output), perM(r.CacheRead), perM(r.CacheWrite), perM(r.CacheWrite1h))
+		}
+		printRates("base", e.Rates(0))
+		for _, t := range e.Tiers {
+			printRates(fmt.Sprintf("> %dk input", t.Above/1000), e.Rates(t.Above+1))
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown prices command %q (want update or show)", args[0])
+}
+
+func perM(perToken float64) string { return fmt.Sprintf("$%.4g", perToken*1e6) }

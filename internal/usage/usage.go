@@ -15,7 +15,10 @@ type Usage struct {
 	OutputTokens     int    `json:"output_tokens"`
 	CacheReadTokens  int    `json:"cache_read_tokens"`  // input served from cache
 	CacheWriteTokens int    `json:"cache_write_tokens"` // input written to cache (Anthropic)
-	ReasoningTokens  int    `json:"reasoning_tokens,omitempty"`
+	// CacheWrite1hTokens is the part of CacheWriteTokens written with the
+	// 1-hour TTL, which is priced higher than the default 5-minute TTL.
+	CacheWrite1hTokens int `json:"cache_write_1h_tokens,omitempty"`
+	ReasoningTokens    int `json:"reasoning_tokens,omitempty"`
 }
 
 // TotalInput is all input tokens, cached or not.
@@ -72,12 +75,16 @@ type anthropicUsage struct {
 	OutputTokens             int `json:"output_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheCreation            struct {
+		Ephemeral1h int `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
 }
 
 func (a anthropicUsage) into(u *Usage) {
 	u.InputTokens = a.InputTokens
 	u.CacheReadTokens = a.CacheReadInputTokens
 	u.CacheWriteTokens = a.CacheCreationInputTokens
+	u.CacheWrite1hTokens = a.CacheCreation.Ephemeral1h
 	if a.OutputTokens > 0 {
 		u.OutputTokens = a.OutputTokens
 	}

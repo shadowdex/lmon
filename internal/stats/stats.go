@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/shadowdex/lmon/internal/pricing"
 	"github.com/shadowdex/lmon/internal/proxy"
 )
 
@@ -27,6 +28,42 @@ type Row struct {
 	P50TotalMs   float64 `json:"p50_total_ms"`
 	P95TotalMs   float64 `json:"p95_total_ms"`
 	AvgTTFBMs    float64 `json:"avg_ttfb_ms"`
+
+	// Estimated cost at standard rates; zero unless a price table was given.
+	CostUSD     float64 `json:"cost_usd"`
+	PricedCalls int     `json:"priced_calls"`
+	// UnpricedCalls are successful calls that couldn't be costed (model not in
+	// the table, or the response carried no usage). Failed calls cost nothing
+	// and are not counted here.
+	UnpricedCalls int `json:"unpriced_calls"`
+}
+
+// CostLabel is the display form of the cost: "$1.23", "$1.23*" when some calls
+// couldn't be priced (so the figure is a lower bound), "n/a" when none could,
+// and "-" when there was nothing to price.
+func (r Row) CostLabel() string {
+	switch {
+	case r.PricedCalls == 0 && r.UnpricedCalls > 0:
+		return "n/a"
+	case r.PricedCalls == 0:
+		return "-"
+	case r.UnpricedCalls > 0:
+		return pricing.FormatUSD(r.CostUSD) + "*"
+	}
+	return pricing.FormatUSD(r.CostUSD)
+}
+
+// PriceEvent prices one event. billable is false for failed calls that
+// returned no usage, which are free and shouldn't count as "unpriced".
+func PriceEvent(tbl *pricing.Table, e proxy.Event) (usd float64, priced, billable bool) {
+	if tbl == nil {
+		return 0, false, false
+	}
+	if !e.HasUsage {
+		return 0, false, e.Status < 400
+	}
+	usd, priced = tbl.CostOf(e.Provider, e.Usage)
+	return usd, priced, true
 }
 
 // Load reads JSONL events, keeping those at or after since (zero = all).
@@ -53,7 +90,10 @@ type acc struct {
 }
 
 // Aggregate groups events by provider and model.
-func Aggregate(events []proxy.Event) []Row {
+func Aggregate(events []proxy.Event) []Row { return AggregateWithPrices(events, nil) }
+
+// AggregateWithPrices is Aggregate plus cost estimates from tbl (nil = none).
+func AggregateWithPrices(events []proxy.Event, tbl *pricing.Table) []Row {
 	m := map[[2]string]*acc{}
 	for _, e := range events {
 		model := e.Model
@@ -74,6 +114,12 @@ func Aggregate(events []proxy.Event) []Row {
 		a.Output += e.OutputTokens
 		a.CacheRead += e.CacheReadTokens
 		a.CacheWrite += e.CacheWriteTokens
+		if usd, priced, billable := PriceEvent(tbl, e); priced {
+			a.CostUSD += usd
+			a.PricedCalls++
+		} else if billable {
+			a.UnpricedCalls++
+		}
 		a.totals = append(a.totals, e.TotalMs)
 		a.ttfbs = append(a.ttfbs, e.TTFBMs)
 	}

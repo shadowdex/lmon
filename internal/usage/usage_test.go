@@ -55,3 +55,19 @@ func TestNoUsage(t *testing.T) {
 		t.Fatal("expected no usage")
 	}
 }
+
+func TestAnthropicCacheWrite1hBreakdown(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-5-5","usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":30,"ephemeral_1h_input_tokens":70}}}`)
+	u, ok := Anthropic{}.ParseJSON(body)
+	if !ok || u.CacheWriteTokens != 100 || u.CacheWrite1hTokens != 70 {
+		t.Fatalf("got %+v ok=%v", u, ok)
+	}
+	sse := []byte("data: " + `{"type":"message_start","message":{"model":"m","usage":{"input_tokens":1,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":10}}}}` + "\n\n")
+	if u, _ := (Anthropic{}).ParseSSE(sse); u.CacheWrite1hTokens != 10 {
+		t.Fatalf("sse: %+v", u)
+	}
+	// Responses without the breakdown leave it at zero (all 5-minute).
+	if u, _ := (Anthropic{}).ParseJSON([]byte(`{"usage":{"input_tokens":1,"cache_creation_input_tokens":5}}`)); u.CacheWrite1hTokens != 0 {
+		t.Fatalf("no breakdown: %+v", u)
+	}
+}
