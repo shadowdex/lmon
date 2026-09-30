@@ -59,6 +59,44 @@ Providers: anthropic, openai, xai, groq, mistral, deepseek, openrouter
 - The proxy binds to loopback only because it forwards your API keys.
 - Release: `goreleaser release --clean` (builds macOS/Linux/Windows, amd64/arm64).
 
+## Prometheus
+
+`lmon proxy` serves Prometheus metrics at `http://127.0.0.1:8787/metrics`. To scrape from a
+Prometheus or Grafana running in Docker, which can't reach the host's loopback, add
+`--metrics-addr 0.0.0.0:9464` (the metrics hold no API keys but do show models and usage).
+Add `--probe-host api.anthropic.com,api.openai.com` to probe endpoints in the background
+(`--probe-every 60s`; this makes outbound HTTPS requests).
+
+| Metric | Labels |
+|---|---|
+| `lmon_requests_total` | provider, model, code |
+| `lmon_tokens_total` | provider, model, type = input, output, cache_read, cache_write |
+| `lmon_cost_usd_total`, `lmon_unpriced_requests_total` | provider, model (needs `lmon prices update`) |
+| `lmon_request_duration_seconds`, `lmon_time_to_first_byte_seconds` (histograms) | provider, model |
+| `lmon_web_search_requests_total`, `lmon_inflight_requests`, `lmon_build_info` | |
+| `lmon_probe_success`, `_http_status`, `_phase_seconds`, `_dns_seconds`, `_dns_success`, `_dns_answers`, `_ip_info`, `_last_run_timestamp_seconds` | host, resolver, phase, ip, country, city |
+
+```yaml
+scrape_configs:
+  - job_name: lmon
+    static_configs: [{targets: ['host.docker.internal:9464']}]
+```
+
+```promql
+sum by (model) (increase(lmon_cost_usd_total[1h]))                          # spend per model
+histogram_quantile(0.95, sum by (le, model) (rate(lmon_request_duration_seconds_bucket[5m])))
+sum(rate(lmon_tokens_total{type="cache_read"}[5m])) / sum(rate(lmon_tokens_total{type=~"input|cache_read|cache_write"}[5m]))   # cache hit ratio
+sum(rate(lmon_requests_total{code=~"4..|5.."}[5m])) / sum(rate(lmon_requests_total[5m]))   # error rate
+lmon_probe_success == 0                                                     # endpoint unreachable
+```
+
+`lmon_probe_ip_info` has one series per resolved address, labeled with its location, so the
+endpoint moving shows up as series appearing and disappearing. Only calls through the proxy
+are counted (Claude Code's own logs are not part of `/metrics`). The price table reloads by
+itself after `lmon prices update`. At most 200 distinct models get their own series; the rest
+are folded into `model="other"`. The exposition is hand-written (no client library) and is
+checked with Prometheus' `promtool check metrics`.
+
 ## Attribution
 
 IP geolocation by [DB-IP.com](https://db-ip.com) (CC BY 4.0).

@@ -18,6 +18,7 @@ import (
 
 	"github.com/shadowdex/lmon/internal/claudecode"
 	"github.com/shadowdex/lmon/internal/geoip"
+	"github.com/shadowdex/lmon/internal/metrics"
 	"github.com/shadowdex/lmon/internal/pricing"
 	"github.com/shadowdex/lmon/internal/probe"
 	"github.com/shadowdex/lmon/internal/proxy"
@@ -34,8 +35,9 @@ var (
 const usageText = `lmon - LLM usage, latency and endpoint monitor
 
 Usage:
-  lmon proxy [--port 8787] [--log PATH] [--max-size-mb 50] [--keep 3]
-                                          run the local recording proxy (rotates its log by size)
+  lmon proxy [--port 8787] [--log PATH] [--max-size-mb 50] [--keep 3] [--probe-host H] [--metrics-addr :9464]
+                                          run the local recording proxy (rotates its log by size;
+                                          Prometheus metrics at /metrics)
   lmon stats [--since 24h] [--json] [--claude]
                                           summarize recorded calls (--claude adds Claude Code sessions)
   lmon top [--window 15m] [--claude]      live terminal view (keys: w window, s sort, p pause, q quit)
@@ -93,9 +95,21 @@ func runProxy(args []string) error {
 	logPath := fs.String("log", proxy.DefaultLogPath(), "event log (JSONL)")
 	maxMB := fs.Int("max-size-mb", int(proxy.DefaultRotation.MaxBytes>>20), "rotate the log at this size in MB (0 = never rotate)")
 	keep := fs.Int("keep", proxy.DefaultRotation.Keep, "rotated log files to keep")
+	metricsAddr := fs.String("metrics-addr", "", "also serve /metrics on this separate address, e.g. 0.0.0.0:9464 so a Prometheus in Docker can scrape it (metrics hold no API keys, but do show models and usage)")
+	probeHosts := fs.String("probe-host", "", "comma-separated hosts to probe in the background for /metrics (e.g. api.anthropic.com); makes outbound HTTPS requests")
+	probeEvery := fs.Duration("probe-every", time.Minute, "how often to probe --probe-host hosts")
 	fs.Parse(args)
 	if *maxMB < 0 || *keep < 0 {
 		return fmt.Errorf("--max-size-mb and --keep must not be negative")
+	}
+	if *probeEvery < 10*time.Second {
+		return fmt.Errorf("--probe-every must be at least 10s")
+	}
+	var hosts []string
+	for _, h := range strings.Split(*probeHosts, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			hosts = append(hosts, strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(h, "https://"), "http://"), "/"))
+		}
 	}
 
 	lg, err := proxy.NewRotatingLogger(*logPath, proxy.Rotation{MaxBytes: int64(*maxMB) << 20, Keep: *keep})
@@ -105,17 +119,51 @@ func runProxy(args []string) error {
 	lg.OnError = func(err error) { fmt.Fprintln(os.Stderr, "lmon: log:", err) }
 	defer lg.Close()
 
+	// Prices reload on their own, so `lmon prices update` needs no restart.
+	prices := &pricing.Reloader{Path: pricing.DefaultPath()}
+	reg := metrics.New(version, prices.Get)
+	lg.OnEvent = reg.Observe
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if len(hosts) > 0 {
+		go reg.RunProbes(ctx, hosts, *probeEvery, func() string { return geoip.Resolve(os.Getenv("LMON_GEOIP_DB")) }, 10*time.Second)
+	}
+
+	api := proxy.Handler(lg, nil)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			reg.ServeHTTP(w, r)
+			return
+		}
+		defer reg.Track()()
+		api.ServeHTTP(w, r)
+	})
+
 	// Bind to loopback only: the proxy forwards your API keys.
-	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", *port), Handler: proxy.Handler(lg, nil)}
+	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", *port), Handler: handler}
+	var msrv *http.Server
+	if *metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", reg)
+		msrv = &http.Server{Addr: *metricsAddr, Handler: mux}
+		go func() {
+			if err := msrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				fmt.Fprintln(os.Stderr, "lmon: metrics listener:", err)
+			}
+		}()
+		fmt.Fprintf(os.Stderr, "lmon metrics also on http://%s/metrics\n", *metricsAddr)
+	}
 	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt)
-		<-sig
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		srv.Shutdown(ctx)
+		if msrv != nil {
+			msrv.Shutdown(sctx)
+		}
+		srv.Shutdown(sctx)
 	}()
-	fmt.Fprintf(os.Stderr, "lmon proxy listening on http://%s, logging to %s\n", srv.Addr, *logPath)
+	fmt.Fprintf(os.Stderr, "lmon proxy listening on http://%s, logging to %s, metrics at /metrics\n", srv.Addr, *logPath)
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		return err
 	}

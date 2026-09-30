@@ -63,6 +63,10 @@ type Logger struct {
 	// OnError, if set, is called for write and rotation failures. Events are
 	// never dropped because rotation failed: the logger keeps appending.
 	OnError func(error)
+	// OnEvent, if set, sees every event before it is written, so metrics count
+	// a call even when the log write fails. Set it before serving; it is called
+	// from request goroutines and must be safe for concurrent use.
+	OnEvent func(Event)
 
 	mu      sync.Mutex
 	f       *os.File
@@ -112,6 +116,9 @@ func (l *Logger) report(err error) {
 }
 
 func (l *Logger) Write(e Event) {
+	if l.OnEvent != nil {
+		l.OnEvent(e)
+	}
 	b, _ := json.Marshal(e)
 	b = append(b, '\n')
 	l.mu.Lock()

@@ -2,6 +2,7 @@ package pricing
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shadowdex/lmon/internal/usage"
 )
@@ -300,5 +302,49 @@ func TestSearchPricePicksMediumElseCheapest(t *testing.T) {
 	}
 	if searchPrice(map[string]any{}) != nil || searchPrice(map[string]any{"search_context_cost_per_query": "x"}) != nil {
 		t.Fatal("absent or malformed must be nil")
+	}
+}
+
+func TestReloaderPicksUpNewTableAndKeepsLastGoodOne(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "prices.json")
+	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	r := &Reloader{Path: p, Every: 30 * time.Second, now: func() time.Time { return clock }}
+	if r.Get() != nil {
+		t.Fatal("no file yet: expected nil")
+	}
+	write := func(models int, mod time.Time) {
+		m := map[string]Entry{}
+		for i := 0; i < models; i++ {
+			m[fmt.Sprintf("m%d", i)] = Entry{Provider: "openai", partial: partial{Input: f(1), Output: f(1)}}
+		}
+		if err := (&Table{Models: m}).Save(p); err != nil {
+			t.Fatal(err)
+		}
+		os.Chtimes(p, mod, mod)
+	}
+	write(1, clock)
+	clock = clock.Add(31 * time.Second)
+	if tb := r.Get(); tb == nil || len(tb.Models) != 1 {
+		t.Fatalf("first load: %+v", tb)
+	}
+	write(3, clock.Add(time.Minute)) // `prices update` replaced the file
+	clock = clock.Add(5 * time.Second)
+	if tb := r.Get(); len(tb.Models) != 1 {
+		t.Fatal("must not re-stat within the Every interval")
+	}
+	clock = clock.Add(31 * time.Second)
+	if tb := r.Get(); len(tb.Models) != 3 {
+		t.Fatalf("new table not picked up: %d", len(tb.Models))
+	}
+	os.WriteFile(p, []byte("{corrupt"), 0o644)
+	os.Chtimes(p, clock.Add(time.Hour), clock.Add(time.Hour))
+	clock = clock.Add(31 * time.Second)
+	if tb := r.Get(); tb == nil || len(tb.Models) != 3 {
+		t.Fatal("a corrupt file must keep serving the last good table")
+	}
+	os.Remove(p)
+	clock = clock.Add(31 * time.Second)
+	if r.Get() != nil {
+		t.Fatal("deleted file: costs should switch off")
 	}
 }

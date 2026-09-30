@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shadowdex/lmon/internal/usage"
@@ -275,4 +276,49 @@ func (t *Table) Suggest(provider, model string, n int) []string {
 		out = out[:n]
 	}
 	return out
+}
+
+// Reloader serves the current price table to a long-running process and picks
+// up `lmon prices update` without a restart. It stats the file at most once per
+// Every, and keeps the last good table if the file becomes unreadable.
+type Reloader struct {
+	Path  string
+	Every time.Duration // default 30s
+
+	mu      sync.Mutex
+	tbl     *Table
+	mtime   time.Time
+	checked time.Time
+	now     func() time.Time // for tests
+}
+
+func (r *Reloader) Get() *Table {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now
+	if r.now != nil {
+		now = r.now
+	}
+	every := r.Every
+	if every == 0 {
+		every = 30 * time.Second
+	}
+	if !r.checked.IsZero() && now().Sub(r.checked) < every {
+		return r.tbl
+	}
+	r.checked = now()
+	st, err := os.Stat(r.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			r.tbl, r.mtime = nil, time.Time{}
+		}
+		return r.tbl
+	}
+	if st.ModTime().Equal(r.mtime) && r.tbl != nil {
+		return r.tbl
+	}
+	if t, err := Load(r.Path); err == nil && t != nil {
+		r.tbl, r.mtime = t, st.ModTime()
+	}
+	return r.tbl
 }
