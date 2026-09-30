@@ -7,9 +7,15 @@ ROOT/<tag>/<file>   served at /releases/download/<tag>/<file>
 ROOT/.latest        tag that /releases/latest redirects to (default v9.9.9)
 ROOT/.no-latest     if it exists, /releases/latest returns 404 (no release yet)
 """
+import faulthandler
 import http.server
 import os
+import socketserver
 import sys
+
+# If startup ever hangs, print where after 8s (the test script waits 10s and
+# reports this output), instead of failing with no explanation.
+faulthandler.dump_traceback_later(8, exit=False)
 
 root, portfile = sys.argv[1], sys.argv[2]
 
@@ -48,6 +54,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-open(portfile, "w").write(str(server.server_address[1]))
+class Server(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind() calls socket.getfqdn(), a reverse DNS lookup
+        # that can stall for a long time on CI runners. We don't need the name.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+server = Server(("127.0.0.1", 0), Handler)
+with open(portfile, "w") as f:  # closed (and flushed) before we report ready
+    f.write(str(server.server_address[1]))
+faulthandler.cancel_dump_traceback_later()
 server.serve_forever()
