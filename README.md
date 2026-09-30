@@ -1,6 +1,20 @@
-# lmon
+```text
+██╗     ███╗   ███╗ ██████╗ ███╗   ██╗
+██║     ████╗ ████║██╔═══██╗████╗  ██║
+██║     ██╔████╔██║██║   ██║██╔██╗ ██║
+██║     ██║╚██╔╝██║██║   ██║██║╚██╗██║
+███████╗██║ ╚═╝ ██║╚██████╔╝██║ ╚████║
+╚══════╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
+```
 
-LLM usage, latency and endpoint monitor. One static binary, no runtime.
+**LLM usage, latency and endpoint monitor.** One static binary, any provider, no runtime.
+
+[![CI](https://github.com/shadowdex/lmon/actions/workflows/ci.yml/badge.svg)](https://github.com/shadowdex/lmon/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/shadowdex/lmon?include_prereleases)](https://github.com/shadowdex/lmon/releases)
+[![License: MIT](https://img.shields.io/github/license/shadowdex/lmon)](LICENSE)
+[![Go](https://img.shields.io/github/go-mod/go-version/shadowdex/lmon)](go.mod)
+
+[Install](#install) · [Use](#use) · [Prometheus](#prometheus) · [Releases](https://github.com/shadowdex/lmon/releases)
 
 ## Install
 
