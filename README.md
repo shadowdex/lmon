@@ -2,9 +2,37 @@
 
 LLM usage, latency and endpoint monitor. One static binary, no runtime.
 
-```bash
-go install github.com/shadowdex/lmon@latest   # or download a release binary
+## Install
 
+**macOS and Linux**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shadowdex/lmon/main/install.sh | sh
+```
+
+Installs the latest release into `~/.local/bin` (no sudo) after checking its SHA-256 against
+the release's `checksums.txt`. Re-run it to upgrade. `LMON_VERSION=v0.1.0` pins a version
+(pre-releases must be named explicitly), `LMON_INSTALL_DIR=/usr/local/bin` changes the
+directory, and `LMON_DRY_RUN=1` shows what it would download. Read it first if you like:
+[install.sh](install.sh). If the download is cut off, nothing runs.
+
+**Any platform with Go 1.27.1 or newer**
+
+```bash
+go install github.com/shadowdex/lmon@latest
+```
+
+**Windows, or by hand:** download the `.zip` or `.tar.gz` for your platform from
+[Releases](https://github.com/shadowdex/lmon/releases), unpack it and put `lmon` on your `PATH`.
+On macOS use `curl` (or `xattr -d com.apple.quarantine lmon`): the binaries aren't notarized, so a
+browser download is quarantined. Windows SmartScreen may warn for the same reason.
+
+Everything lmon stores (event log, price table, GeoIP database) is under `~/.lmon`; delete the
+binary and that folder to uninstall.
+
+## Use
+
+```bash
 lmon proxy                      # local recording proxy on 127.0.0.1:8787
 export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
 export OPENAI_BASE_URL=http://localhost:8787/openai/v1

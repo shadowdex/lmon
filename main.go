@@ -76,7 +76,8 @@ func main() {
 	case "prices":
 		err = runPrices(args)
 	case "version", "--version", "-v":
-		fmt.Printf("lmon %s (%s)\n", version, commit)
+		v, c := versionInfo()
+		fmt.Printf("lmon %s (%s)\n", v, c)
 	case "help", "--help", "-h":
 		fmt.Print(usageText)
 	default:
@@ -121,7 +122,8 @@ func runProxy(args []string) error {
 
 	// Prices reload on their own, so `lmon prices update` needs no restart.
 	prices := &pricing.Reloader{Path: pricing.DefaultPath()}
-	reg := metrics.New(version, prices.Get)
+	v, _ := versionInfo()
+	reg := metrics.New(v, prices.Get)
 	lg.OnEvent = reg.Observe
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

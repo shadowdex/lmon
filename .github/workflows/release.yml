@@ -1,0 +1,27 @@
+name: release
+# Push a tag like v0.1.0 (or v0.1.0-rc1 for a pre-release) to publish a release.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # create the GitHub Release and upload the archives
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the changelog is built from git history
+      - uses: actions/setup-go@v7
+        with: { go-version-file: go.mod }
+      # Never publish a build that fails its own tests.
+      - run: go vet ./... && go test -race ./...
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -16,12 +16,15 @@ archives:
         formats: [zip]
 
 checksum:
-  name_template: checksums.txt
+  name_template: checksums.txt # install.sh verifies downloads against this
 
-# Uncomment once the repo and tap exist (owner/names below are placeholders).
-# brews:
-#   - repository: { owner: shadowdex, name: homebrew-tap }
-#     homepage: https://github.com/shadowdex/lmon
-#     description: LLM usage, latency and endpoint monitor
-# scoops:
-#   - repository: { owner: shadowdex, name: scoop-bucket }
+changelog:
+  sort: asc
+  filters:
+    exclude: ['^Merge ']
+
+release:
+  prerelease: auto # v0.1.0-rc1 is marked a pre-release and is skipped by "latest"
+
+# Homebrew and Scoop are intentionally not set up: a tap needs its own repo and a
+# token (see README). Installing is via install.sh, `go install`, or the archives.
