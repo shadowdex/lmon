@@ -6,6 +6,9 @@ usage: fake-release-server.py ROOT PORTFILE
 ROOT/<tag>/<file>   served at /releases/download/<tag>/<file>
 ROOT/.latest        tag that /releases/latest redirects to (default v9.9.9)
 ROOT/.no-latest     if it exists, /releases/latest returns 404 (no release yet)
+ROOT/.only-prereleases
+                    if it exists, /releases/latest redirects to the /releases list,
+                    which is what GitHub does when only pre-releases are published
 """
 import faulthandler
 import http.server
@@ -29,6 +32,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p == "/releases/latest":
             if os.path.exists(os.path.join(root, ".no-latest")):
                 return self.send_error(404)
+            if os.path.exists(os.path.join(root, ".only-prereleases")):
+                self.send_response(302)
+                self.send_header("Location", "http://%s/releases" % self.headers["Host"])
+                self.end_headers()
+                return
             try:
                 tag = open(os.path.join(root, ".latest")).read().strip()
             except FileNotFoundError:
@@ -36,6 +44,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", "http://%s/releases/tag/%s" % (self.headers["Host"], tag))
             self.end_headers()
+        elif p == "/releases":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"release list")
         elif p.startswith("/releases/tag/"):
             self.send_response(200)
             self.end_headers()

@@ -120,6 +120,13 @@ D="$WORK/t7"
 run_install "$D"
 if [ $RC -ne 0 ] && echo "$OUT" | grep -q "published release"; then ok "no release published yet: says so"; else bad "no release yet" "rc=$RC $OUT"; fi
 rm -f "$WORK/rel/.no-latest"
+touch "$WORK/rel/.only-prereleases"
+D="$WORK/t7b"
+run_install "$D"
+if [ $RC -ne 0 ] && echo "$OUT" | grep -q "no stable release" && echo "$OUT" | grep -q "LMON_VERSION=" && [ ! -e "$D/lmon" ]; then ok "only pre-releases published: explains and shows how to request one"; else bad "only pre-releases" "rc=$RC $OUT"; fi
+run_install "$WORK/t7c" LMON_VERSION=v9.9.9
+[ $RC -eq 0 ] && ok "a pre-release can still be installed when requested by version" || bad "pin while only pre-releases" "$OUT"
+rm -f "$WORK/rel/.only-prereleases"
 D="$WORK/t8"; mkdir -p "$WORK/afile"; : > "$WORK/afile/x"
 run_install "$WORK/afile/x/sub"
 [ $RC -ne 0 ] && echo "$OUT" | grep -q "LMON_INSTALL_DIR" && ok "unwritable install dir: suggests LMON_INSTALL_DIR" || bad "unwritable dir" "rc=$RC $OUT"

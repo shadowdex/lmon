@@ -19,7 +19,7 @@ checksum:
   name_template: checksums.txt # install.sh verifies downloads against this
 
 changelog:
-  sort: asc
+  abbrev: 7 # short hashes; entries stay in git-log order (newest first)
   filters:
     exclude: ['^Merge ']
 

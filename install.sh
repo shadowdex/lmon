@@ -58,6 +58,12 @@ main() {
     url=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$base/releases/latest") ||
       die "could not find a release at $base/releases/latest (is there a published release yet?)"
     tag=${url##*/}
+    # With only pre-releases (or drafts) published, GitHub redirects to the
+    # /releases list instead of a tag page.
+    case "$url" in
+      */releases/tag/*) ;;
+      *) die "no stable release is published at $base/releases. Pre-releases are only installed when requested, e.g.: LMON_VERSION=v0.1.0-rc1" ;;
+    esac
   fi
   case "$tag" in v[0-9]*) ;; *) die "unexpected release tag '$tag'" ;; esac
   ver=${tag#v}
