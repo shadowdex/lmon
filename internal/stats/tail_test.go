@@ -138,3 +138,46 @@ func TestLoadFilesSkipsFilesOlderThanCutoffAndKeepsOrder(t *testing.T) {
 		t.Fatalf("file last written 48h ago must be skipped, got %d", len(evs))
 	}
 }
+
+// The same inode and the same size but different content: what ext4's inode
+// reuse produces after a delete and recreate. Inode comparison alone can't see
+// it, so this checks the content-based identity on every OS.
+func TestTailerDetectsReplacementWithSameInodeAndSize(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "e.jsonl")
+	tl := &Tailer{Path: p}
+	appendFile(t, p, line("a"))
+	if evs, _ := tl.Poll(); len(evs) != 1 {
+		t.Fatalf("setup: %d", len(evs))
+	}
+	if err := os.WriteFile(p, []byte(line("z")), 0o644); err != nil { // truncates and rewrites the same inode
+		t.Fatal(err)
+	}
+	evs, _ := tl.Poll()
+	if len(evs) != 1 || evs[0].Model != "z" {
+		t.Fatalf("replacement not noticed: %+v", evs)
+	}
+	appendFile(t, p, line("y"))
+	if evs, _ := tl.Poll(); len(evs) != 1 || evs[0].Model != "y" {
+		t.Fatalf("after replacement: %+v", evs)
+	}
+}
+
+func TestTailerDoesNotRereadWhenFileIsSimplyGrowing(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "e.jsonl")
+	tl := &Tailer{Path: p}
+	appendFile(t, p, line("a")[:10]) // less than one head's worth, and a partial line
+	tl.Poll()
+	appendFile(t, p, line("a")[10:])
+	if evs, _ := tl.Poll(); len(evs) != 1 {
+		t.Fatalf("got %d", len(evs))
+	}
+	for i := 0; i < 5; i++ { // head grows past headBytes; nothing may repeat
+		appendFile(t, p, line("m"))
+		if evs, _ := tl.Poll(); len(evs) != 1 {
+			t.Fatalf("poll %d got %d events", i, len(evs))
+		}
+	}
+	if evs, _ := tl.Poll(); len(evs) != 0 {
+		t.Fatalf("idle poll returned %d", len(evs))
+	}
+}

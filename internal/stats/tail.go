@@ -25,6 +25,37 @@ type Tailer struct {
 	partial []byte
 	started bool
 	info    os.FileInfo // identity of the file we are reading
+	head    []byte      // first bytes of that file, to tell it from a replacement
+}
+
+// headBytes is how much of the start of the file identifies it. Every event
+// line begins with a nanosecond timestamp, so two different logs differ here.
+const headBytes = 128
+
+// sameStart reports whether the file still begins with the bytes seen before,
+// and extends the remembered prefix as the file grows. The inode alone isn't
+// enough: filesystems such as ext4 reuse a freed inode number at once, so a
+// deleted-and-recreated log can look like the same file.
+func (t *Tailer) sameStart(f *os.File, size int64) bool {
+	n := size
+	if n > headBytes {
+		n = headBytes
+	}
+	cur := make([]byte, n)
+	if n > 0 {
+		if _, err := f.ReadAt(cur, 0); err != nil && err != io.EOF {
+			return true // can't tell; don't discard state over a transient error
+		}
+	}
+	if len(t.head) > 0 {
+		if int64(len(t.head)) > size || !bytes.Equal(cur[:len(t.head)], t.head) {
+			return false
+		}
+	}
+	if len(cur) > len(t.head) {
+		t.head = cur
+	}
+	return true
 }
 
 func (t *Tailer) Poll() ([]proxy.Event, error) {
@@ -41,13 +72,17 @@ func (t *Tailer) Poll() ([]proxy.Event, error) {
 		return nil, err
 	}
 
+	size := st.Size()
 	var out []proxy.Event
-	if t.info != nil && !os.SameFile(t.info, st) { // rotated or replaced
+	switch {
+	case t.info == nil: // first poll
+		t.sameStart(f, size)
+	case !os.SameFile(t.info, st) || !t.sameStart(f, size): // rotated or replaced
 		out = t.drainRotated()
-		t.offset, t.partial = 0, nil
+		t.offset, t.partial, t.head = 0, nil, nil
+		t.sameStart(f, size)
 	}
 	t.info = st
-	size := st.Size()
 
 	if size < t.offset { // truncated in place: start over
 		t.offset, t.partial = 0, nil
