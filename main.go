@@ -12,6 +12,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/shadowdex/lmon/internal/geoip"
 	"github.com/shadowdex/lmon/internal/probe"
 	"github.com/shadowdex/lmon/internal/proxy"
 	"github.com/shadowdex/lmon/internal/stats"
@@ -30,6 +31,8 @@ Usage:
   lmon stats [--since 24h] [--json]       summarize recorded calls
   lmon probe <host> [--geoip FILE] [--json]
                                           DNS, geo and connection timing for an endpoint
+  lmon geoip update                       download the free DB-IP city database (~/.lmon)
+  lmon geoip path                         print the database path in use
   lmon version
 
 Point your SDK at the proxy:
@@ -52,6 +55,8 @@ func main() {
 		err = runStats(args)
 	case "probe":
 		err = runProbe(args)
+	case "geoip":
+		err = runGeoIP(args)
 	case "version", "--version", "-v":
 		fmt.Printf("lmon %s (%s)\n", version, commit)
 	case "help", "--help", "-h":
@@ -138,7 +143,7 @@ func runStats(args []string) error {
 
 func runProbe(args []string) error {
 	fs := flag.NewFlagSet("probe", flag.ExitOnError)
-	geo := fs.String("geoip", os.Getenv("LMON_GEOIP_DB"), "path to a GeoLite2-City .mmdb (or $LMON_GEOIP_DB)")
+	geoFlag := fs.String("geoip", os.Getenv("LMON_GEOIP_DB"), "path to a City .mmdb (default: ~/.lmon database from `lmon geoip update`, or $LMON_GEOIP_DB)")
 	asJSON := fs.Bool("json", false, "JSON output")
 	timeout := fs.Duration("timeout", 10*time.Second, "per-step timeout")
 	// Allow the host before or after flags.
@@ -155,7 +160,8 @@ func runProbe(args []string) error {
 	}
 	host = strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://"), "/")
 
-	res := probe.Run(context.Background(), host, *geo, *timeout)
+	geo := geoip.Resolve(*geoFlag)
+	res := probe.Run(context.Background(), host, geo, *timeout)
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -181,8 +187,10 @@ func runProbe(args []string) error {
 		}
 		fmt.Printf("  %s  %s\n", ip.IP, loc)
 	}
-	if *geo == "" {
-		fmt.Println("  (no geo data: pass --geoip or set LMON_GEOIP_DB to a GeoLite2-City .mmdb)")
+	if geo == "" {
+		fmt.Println("  (no geo data: run `lmon geoip update`, or pass --geoip FILE)")
+	} else if geo == geoip.DefaultPath() {
+		fmt.Println("  " + geoip.Attribution)
 	}
 
 	t := res.Timing
@@ -193,4 +201,28 @@ func runProbe(args []string) error {
 	fmt.Printf("  remote %s  status %d\n  dns %s  tcp %s  tls %s  ttfb %s  total %s\n",
 		t.Remote, t.Status, t.DNS, t.Connect, t.TLS, t.TTFB, t.Total)
 	return nil
+}
+
+func runGeoIP(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: lmon geoip update | path")
+	}
+	switch args[0] {
+	case "update":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		_, err := geoip.Update(ctx, geoip.Options{Out: os.Stderr})
+		return err
+	case "path":
+		p := geoip.Resolve(os.Getenv("LMON_GEOIP_DB"))
+		if p == "" {
+			return fmt.Errorf("no database yet; run `lmon geoip update`")
+		}
+		fmt.Println(p)
+		if age, err := geoip.Age(p); err == nil && age > 45*24*time.Hour {
+			fmt.Fprintf(os.Stderr, "note: database is %d days old; `lmon geoip update` refreshes it (published monthly)\n", int(age.Hours()/24))
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown geoip command %q (want update or path)", args[0])
 }
