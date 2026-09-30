@@ -1,0 +1,27 @@
+version: 2
+project_name: lmon
+
+builds:
+  - main: .
+    binary: lmon
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags: ["-s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}}"]
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+# Uncomment once the repo and tap exist (owner/names below are placeholders).
+# brews:
+#   - repository: { owner: shadowdex, name: homebrew-tap }
+#     homepage: https://github.com/shadowdex/lmon
+#     description: LLM usage, latency and endpoint monitor
+# scoops:
+#   - repository: { owner: shadowdex, name: scoop-bucket }
