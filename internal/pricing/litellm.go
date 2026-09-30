@@ -66,6 +66,7 @@ func Reduce(raw []byte) (*Table, error) {
 		if e.Input == nil || e.Output == nil {
 			continue
 		}
+		e.WebSearch = searchPrice(m)
 		tiers := map[int]*Tier{}
 		for field := range m {
 			g := tierField.FindStringSubmatch(field)
@@ -103,6 +104,27 @@ func Reduce(raw []byte) (*Table, error) {
 		return nil, fmt.Errorf("no priceable models found in the download")
 	}
 	return t, nil
+}
+
+// searchPrice reads search_context_cost_per_query, which LiteLLM keys by
+// context size. Anthropic charges one flat price, so any size is the same; for
+// others we use the medium tier, else the cheapest listed.
+func searchPrice(m map[string]any) *float64 {
+	q, ok := m["search_context_cost_per_query"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	if v, ok := q["search_context_size_medium"].(float64); ok && v >= 0 {
+		return &v
+	}
+	var best *float64
+	for _, x := range q {
+		if v, ok := x.(float64); ok && v >= 0 && (best == nil || v < *best) {
+			c := v
+			best = &c
+		}
+	}
+	return best
 }
 
 type UpdateOptions struct {

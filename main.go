@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -15,6 +16,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/term"
 
+	"github.com/shadowdex/lmon/internal/claudecode"
 	"github.com/shadowdex/lmon/internal/geoip"
 	"github.com/shadowdex/lmon/internal/pricing"
 	"github.com/shadowdex/lmon/internal/probe"
@@ -34,8 +36,9 @@ const usageText = `lmon - LLM usage, latency and endpoint monitor
 Usage:
   lmon proxy [--port 8787] [--log PATH] [--max-size-mb 50] [--keep 3]
                                           run the local recording proxy (rotates its log by size)
-  lmon stats [--since 24h] [--json]       summarize recorded calls
-  lmon top [--window 15m] [--log PATH]    live terminal view (keys: w window, s sort, p pause, q quit)
+  lmon stats [--since 24h] [--json] [--claude]
+                                          summarize recorded calls (--claude adds Claude Code sessions)
+  lmon top [--window 15m] [--claude]      live terminal view (keys: w window, s sort, p pause, q quit)
   lmon probe <host> [--geoip FILE] [--json]
                                           DNS, geo and connection timing for an endpoint
   lmon prices update                      download model prices (enables cost estimates)
@@ -124,11 +127,13 @@ func runStats(args []string) error {
 	logPath := fs.String("log", proxy.DefaultLogPath(), "event log (JSONL)")
 	since := fs.Duration("since", 24*time.Hour, "only include calls newer than this (0 = all)")
 	asJSON := fs.Bool("json", false, "JSON output")
+	withClaude := fs.Bool("claude", false, "also include Claude Code sessions, read from its own logs (no latency data)")
+	claudeDir := fs.String("claude-dir", "", "Claude config dir(s), comma separated (default $CLAUDE_CONFIG_DIR, else ~/.claude)")
 	fs.Parse(args)
 
 	files := proxy.LogFiles(*logPath)
-	if len(files) == 0 {
-		return fmt.Errorf("no events yet at %s; run `lmon proxy` and send some requests", *logPath)
+	if len(files) == 0 && !*withClaude {
+		return fmt.Errorf("no events yet at %s; run `lmon proxy` and send some requests (or add --claude)", *logPath)
 	}
 	var cutoff time.Time
 	if *since > 0 {
@@ -137,6 +142,16 @@ func runStats(args []string) error {
 	events, err := stats.LoadFiles(files, cutoff)
 	if err != nil {
 		return err
+	}
+	if *withClaude {
+		sc, err := claudeScanner(*claudeDir, cutoff)
+		if err != nil {
+			return err
+		}
+		if _, err := sc.Poll(); err != nil {
+			fmt.Fprintln(os.Stderr, "lmon: claude logs:", err)
+		}
+		events = stats.Merge(events, sc.All())
 	}
 	tbl := loadPrices()
 	rows := stats.AggregateWithPrices(events, tbl)
@@ -162,12 +177,21 @@ func runStats(args []string) error {
 		if tbl != nil {
 			cost = "\t" + r.CostLabel()
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%.0f%%\t%.0fms\t%.0fms\t%.0fms\t%.0fms%s\n",
+		ms := func(v float64) string {
+			if r.LatencyCalls == 0 {
+				return "-" // e.g. Claude Code sessions: the proxy never saw them
+			}
+			return fmt.Sprintf("%.0fms", v)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%.0f%%\t%s\t%s\t%s\t%s%s\n",
 			r.Provider, r.Model, r.Calls, r.Errors, r.Input, r.Output, r.CacheRead, r.CacheWrite,
-			r.CacheHitRate*100, r.AvgTotalMs, r.P50TotalMs, r.P95TotalMs, r.AvgTTFBMs, cost)
+			r.CacheHitRate*100, ms(r.AvgTotalMs), ms(r.P50TotalMs), ms(r.P95TotalMs), ms(r.AvgTTFBMs), cost)
 	}
 	if err := tw.Flush(); err != nil {
 		return err
+	}
+	if *withClaude {
+		fmt.Fprintln(os.Stderr, "\nnote: Claude Code rows come from its session logs, which omit some billed calls, so they are approximate and usually slightly low; they also have no latency (-)")
 	}
 	switch {
 	case tbl == nil:
@@ -284,12 +308,21 @@ func runTop(args []string) error {
 	fs := flag.NewFlagSet("top", flag.ExitOnError)
 	logPath := fs.String("log", proxy.DefaultLogPath(), "event log (JSONL)")
 	window := fs.Duration("window", 15*time.Minute, "initial window: rounds up to 5m, 15m, 1h or 24h")
+	withClaude := fs.Bool("claude", false, "also include Claude Code sessions, read live from its own logs")
+	claudeDir := fs.String("claude-dir", "", "Claude config dir(s), comma separated (default $CLAUDE_CONFIG_DIR, else ~/.claude)")
 	fs.Parse(args)
 
 	if !term.IsTerminal(os.Stdout.Fd()) {
 		return fmt.Errorf("top needs an interactive terminal; use `lmon stats` for piped output")
 	}
-	_, err := tea.NewProgram(tui.New(*logPath, *window, loadPrices())).Run()
+	var sc *claudecode.Scanner
+	if *withClaude {
+		var err error
+		if sc, err = claudeScanner(*claudeDir, time.Now().Add(-tui.Retention())); err != nil {
+			return err
+		}
+	}
+	_, err := tea.NewProgram(tui.New(*logPath, *window, loadPrices(), sc)).Run()
 	return err
 }
 
@@ -337,3 +370,27 @@ func runPrices(args []string) error {
 }
 
 func perM(perToken float64) string { return fmt.Sprintf("$%.4g", perToken*1e6) }
+
+// claudeScanner builds a scanner over Claude Code's project logs. dirs is a
+// comma-separated list of Claude config dirs ("" = the defaults).
+func claudeScanner(dirs string, since time.Time) (*claudecode.Scanner, error) {
+	roots := claudecode.DefaultRoots()
+	if dirs != "" {
+		roots = nil
+		for _, d := range strings.Split(dirs, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				roots = append(roots, filepath.Join(d, "projects"))
+			}
+		}
+	}
+	var found []string
+	for _, r := range roots {
+		if st, err := os.Stat(r); err == nil && st.IsDir() {
+			found = append(found, r)
+		}
+	}
+	if len(found) == 0 {
+		return nil, fmt.Errorf("no Claude Code logs found (looked for a projects/ dir in $CLAUDE_CONFIG_DIR, ~/.claude, ~/.config/claude); use --claude-dir")
+	}
+	return &claudecode.Scanner{Roots: found, Since: since}, nil
+}

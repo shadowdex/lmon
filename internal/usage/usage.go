@@ -10,11 +10,16 @@ import (
 
 // Usage is the provider-neutral token accounting for one response.
 type Usage struct {
-	Model            string `json:"model,omitempty"`
-	InputTokens      int    `json:"input_tokens"` // uncached input
-	OutputTokens     int    `json:"output_tokens"`
-	CacheReadTokens  int    `json:"cache_read_tokens"`  // input served from cache
-	CacheWriteTokens int    `json:"cache_write_tokens"` // input written to cache (Anthropic)
+	Model string `json:"model,omitempty"`
+	// ID is the provider's response id (Anthropic "msg_..."). It lets the same
+	// call be recognised across sources, e.g. the proxy and Claude Code's logs.
+	ID string `json:"id,omitempty"`
+	// WebSearchRequests is the number of server-side web searches, billed per query.
+	WebSearchRequests int `json:"web_search_requests,omitempty"`
+	InputTokens       int `json:"input_tokens"` // uncached input
+	OutputTokens      int `json:"output_tokens"`
+	CacheReadTokens   int `json:"cache_read_tokens"`  // input served from cache
+	CacheWriteTokens  int `json:"cache_write_tokens"` // input written to cache (Anthropic)
 	// CacheWrite1hTokens is the part of CacheWriteTokens written with the
 	// 1-hour TTL, which is priced higher than the default 5-minute TTL.
 	CacheWrite1hTokens int `json:"cache_write_1h_tokens,omitempty"`
@@ -78,6 +83,9 @@ type anthropicUsage struct {
 	CacheCreation            struct {
 		Ephemeral1h int `json:"ephemeral_1h_input_tokens"`
 	} `json:"cache_creation"`
+	ServerToolUse struct {
+		WebSearchRequests int `json:"web_search_requests"`
+	} `json:"server_tool_use"`
 }
 
 func (a anthropicUsage) into(u *Usage) {
@@ -85,6 +93,7 @@ func (a anthropicUsage) into(u *Usage) {
 	u.CacheReadTokens = a.CacheReadInputTokens
 	u.CacheWriteTokens = a.CacheCreationInputTokens
 	u.CacheWrite1hTokens = a.CacheCreation.Ephemeral1h
+	u.WebSearchRequests = a.ServerToolUse.WebSearchRequests
 	if a.OutputTokens > 0 {
 		u.OutputTokens = a.OutputTokens
 	}
@@ -92,13 +101,14 @@ func (a anthropicUsage) into(u *Usage) {
 
 func (Anthropic) ParseJSON(body []byte) (Usage, bool) {
 	var r struct {
+		ID    string          `json:"id"`
 		Model string          `json:"model"`
 		Usage *anthropicUsage `json:"usage"`
 	}
 	if json.Unmarshal(body, &r) != nil || r.Usage == nil {
 		return Usage{}, false
 	}
-	u := Usage{Model: r.Model}
+	u := Usage{Model: r.Model, ID: r.ID}
 	r.Usage.into(&u)
 	return u, true
 }
@@ -112,6 +122,7 @@ func (Anthropic) ParseSSE(body []byte) (Usage, bool) {
 		var ev struct {
 			Type    string `json:"type"`
 			Message struct {
+				ID    string          `json:"id"`
 				Model string          `json:"model"`
 				Usage *anthropicUsage `json:"usage"`
 			} `json:"message"`
@@ -122,7 +133,7 @@ func (Anthropic) ParseSSE(body []byte) (Usage, bool) {
 		}
 		switch ev.Type {
 		case "message_start":
-			u.Model = ev.Message.Model
+			u.Model, u.ID = ev.Message.Model, ev.Message.ID
 			if ev.Message.Usage != nil {
 				ev.Message.Usage.into(&u)
 				found = true
@@ -131,6 +142,9 @@ func (Anthropic) ParseSSE(body []byte) (Usage, bool) {
 			if ev.Usage != nil {
 				if ev.Usage.OutputTokens > 0 {
 					u.OutputTokens = ev.Usage.OutputTokens
+				}
+				if n := ev.Usage.ServerToolUse.WebSearchRequests; n > 0 {
+					u.WebSearchRequests = n // the delta carries the final count
 				}
 				found = true
 			}

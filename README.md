@@ -11,6 +11,8 @@ export OPENAI_BASE_URL=http://localhost:8787/openai/v1
 
 lmon stats --since 24h          # tokens, cache hit rate, latency (avg/p50/p95/TTFB)
 lmon top                        # live view: w window, s sort, p pause, q quit
+lmon stats --claude             # also count Claude Code sessions (reads its own logs)
+lmon top --claude               # same, live
 lmon prices update              # one-time: download model prices (enables cost estimates)
 lmon prices show anthropic claude-sonnet-5-5   # the rates lmon will use
 lmon geoip update               # one-time: download the free DB-IP city database
@@ -30,6 +32,18 @@ Providers: anthropic, openai, xai, groq, mistral, deepseek, openrouter
   figure is a lower bound; `n/a` means none could. Failed calls cost nothing. Models are matched
   by exact name or name minus a snapshot date, never by prefix, so an unlisted model shows
   `n/a` instead of a wrong price.
+- **Claude Code sessions** (`--claude`) are read straight from its logs
+  (`$CLAUDE_CONFIG_DIR`, else `~/.claude/projects`, including subagent files), so nothing has
+  to go through the proxy. Only usage numbers, model, response id and timestamp are read;
+  prompts and replies are never kept. A response spans several log lines whose
+  `output_tokens` grow while it streams, so responses are merged by `message.id` taking the
+  largest value, and a call seen by both the proxy and Claude Code is counted once (the
+  proxy's copy wins because it has latency). Imported calls have no latency (shown as `-`).
+  **Treat these figures as approximate and usually slightly low.** Claude Code's logs don't
+  contain every billed call. Checked against the totals Claude Code records itself, across
+  55 sessions of one user, the logs accounted for 93% of the cost (per session: 69% to 106%,
+  median 91%). The per-response token counts and prices matched exactly where the logs were
+  complete; I could not tell why some billed usage is missing from the logs.
 - Events are appended to `~/.lmon/events.jsonl`. Prompts and responses are never stored.
   The log rotates by size (`lmon proxy --max-size-mb 50 --keep 3`, about 200 MB at most;
   `--max-size-mb 0` disables it). `stats` and `top` read the rotated files too. Run one

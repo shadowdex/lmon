@@ -10,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/shadowdex/lmon/internal/claudecode"
 	"github.com/shadowdex/lmon/internal/pricing"
 	"github.com/shadowdex/lmon/internal/proxy"
 	"github.com/shadowdex/lmon/internal/stats"
@@ -33,6 +34,9 @@ var (
 	cyan   = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
 )
 
+// Retention is how far back `top` keeps events (its largest window).
+func Retention() time.Duration { return retention }
+
 type tickMsg time.Time
 
 // Model is the Bubble Tea model for `lmon top`.
@@ -42,6 +46,11 @@ type Model struct {
 	now    func() time.Time
 	prices *pricing.Table // nil = no cost column
 
+	// Optional Claude Code source. Responses are upserted by ID because a
+	// response's output_tokens keeps growing while it streams.
+	claude   *claudecode.Scanner
+	imported map[string]proxy.Event
+
 	window int // index into Windows
 	sortBy int // index into sortKeys
 	paused bool
@@ -50,9 +59,10 @@ type Model struct {
 }
 
 // New creates the model and loads existing history immediately. prices may be
-// nil, in which case costs are not shown.
-func New(logPath string, window time.Duration, prices *pricing.Table) *Model {
-	m := &Model{tailer: &stats.Tailer{Path: logPath}, now: time.Now, prices: prices}
+// nil (costs are not shown) and claude may be nil (proxy events only).
+func New(logPath string, window time.Duration, prices *pricing.Table, claude *claudecode.Scanner) *Model {
+	m := &Model{tailer: &stats.Tailer{Path: logPath}, now: time.Now, prices: prices,
+		claude: claude, imported: map[string]proxy.Event{}}
 	m.window = len(Windows) - 1
 	for i, w := range Windows {
 		if w >= window {
@@ -85,6 +95,34 @@ func (m *Model) poll() {
 		i++
 	}
 	m.events = m.events[i:]
+
+	if m.claude != nil {
+		evs, err := m.claude.Poll()
+		if err != nil && m.err == nil {
+			m.err = err
+		}
+		for _, e := range evs {
+			m.imported[e.ID] = e
+		}
+		for id, e := range m.imported {
+			if e.Time.Before(cutoff) {
+				delete(m.imported, id)
+			}
+		}
+	}
+}
+
+// all is every event to show: proxy-observed ones plus Claude Code's, with a
+// call seen by both counted once (the proxy's copy, which has latency).
+func (m *Model) all() []proxy.Event {
+	if m.claude == nil {
+		return m.events
+	}
+	imp := make([]proxy.Event, 0, len(m.imported))
+	for _, e := range m.imported {
+		imp = append(imp, e)
+	}
+	return stats.Merge(m.events, imp)
 }
 
 func tick() tea.Cmd {
@@ -138,7 +176,7 @@ func (m *Model) Render(width int) string {
 	now := m.now()
 	win := Windows[m.window]
 	var in []proxy.Event
-	for _, e := range m.events {
+	for _, e := range m.all() {
 		if !e.Time.Before(now.Add(-win)) {
 			in = append(in, e)
 		}
@@ -149,7 +187,11 @@ func (m *Model) Render(width int) string {
 	if m.paused {
 		state = yellow.Render(" PAUSED")
 	}
-	b.WriteString(bold.Render("lmon top") + dim.Render(fmt.Sprintf("  window %s  sort %s", fmtWindow(win), sortKeys[m.sortBy])) + state + "\n")
+	src := ""
+	if m.claude != nil {
+		src = "  + claude-code (approx., no latency)"
+	}
+	b.WriteString(bold.Render("lmon top") + dim.Render(fmt.Sprintf("  window %s  sort %s%s", fmtWindow(win), sortKeys[m.sortBy], src)) + state + "\n")
 	b.WriteString(dim.Render("[w] window  [s] sort  [p] pause  [q] quit") + "\n\n")
 
 	if m.err != nil {
@@ -189,7 +231,9 @@ func summary(in []proxy.Event, now time.Time, win time.Duration, prices *pricing
 		outTok += e.OutputTokens
 		cacheR += e.CacheReadTokens
 		totIn += e.TotalInput()
-		lat = append(lat, e.TotalMs)
+		if e.HasLatency() {
+			lat = append(lat, e.TotalMs)
+		}
 	}
 	perMin := float64(calls) / win.Minutes()
 	parts := []string{
@@ -207,7 +251,9 @@ func summary(in []proxy.Event, now time.Time, win time.Duration, prices *pricing
 		}
 		parts = append(parts, bold.Render("cost "+pricing.FormatUSD(cost)+mark)+dim.Render(" ("+burnRate(cost, now.Sub(first), win)+")"))
 	}
-	parts = append(parts, fmt.Sprintf("p50 %s  p95 %s", fmtMs(stats.Percentile(lat, 50)), fmtMs(stats.Percentile(lat, 95))))
+	if len(lat) > 0 {
+		parts = append(parts, fmt.Sprintf("p50 %s  p95 %s", fmtMs(stats.Percentile(lat, 50)), fmtMs(stats.Percentile(lat, 95))))
+	}
 	return strings.Join(parts, dim.Render("  ·  "))
 }
 
@@ -222,6 +268,15 @@ func burnRate(cost float64, span, win time.Duration) string {
 		span = win
 	}
 	return pricing.FormatUSD(cost/span.Hours()) + "/h"
+}
+
+// latCell shows a latency, or a dim dash when none of the row's calls went
+// through the proxy (e.g. imported Claude Code sessions).
+func latCell(r rowData, ms float64, w int) string {
+	if r.LatencyCalls == 0 {
+		return dim.Render(pad("-", w, false))
+	}
+	return pad(fmtMs(ms), w, false)
 }
 
 type col struct {
@@ -264,9 +319,9 @@ func (m *Model) table(in []proxy.Event, now time.Time, win time.Duration, width 
 			}
 			return s
 		}},
-		{"P50", 7, false, 4, func(r rowData, w int) string { return pad(fmtMs(r.P50TotalMs), w, false) }},
-		{"P95", 7, false, 0, func(r rowData, w int) string { return pad(fmtMs(r.P95TotalMs), w, false) }},
-		{"TTFB", 7, false, 9, func(r rowData, w int) string { return pad(fmtMs(r.AvgTTFBMs), w, false) }},
+		{"P50", 7, false, 4, func(r rowData, w int) string { return latCell(r, r.P50TotalMs, w) }},
+		{"P95", 7, false, 0, func(r rowData, w int) string { return latCell(r, r.P95TotalMs, w) }},
+		{"TTFB", 7, false, 9, func(r rowData, w int) string { return latCell(r, r.AvgTTFBMs, w) }},
 		{"TREND", trendCells, true, 10, func(r rowData, w int) string { return cyan.Render(pad(sparkline(r.trend), w, true)) }},
 	}
 
@@ -344,7 +399,9 @@ func buildRows(in []proxy.Event, now time.Time, win time.Duration, prices *prici
 			model = "(unknown)"
 		}
 		k := key{e.Provider, model}
-		byKey[k] = append(byKey[k], e)
+		if e.HasLatency() {
+			byKey[k] = append(byKey[k], e)
+		}
 	}
 	rows := make([]rowData, 0, len(agg))
 	for _, r := range agg {

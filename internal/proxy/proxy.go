@@ -27,13 +27,16 @@ import (
 
 // Event is one recorded API call. It never contains prompts or responses.
 type Event struct {
-	Time      time.Time `json:"time"`
-	Provider  string    `json:"provider"`
-	Path      string    `json:"path"`
-	Status    int       `json:"status"`
-	Streaming bool      `json:"streaming"`
-	TTFBMs    float64   `json:"ttfb_ms"`
-	TotalMs   float64   `json:"total_ms"`
+	Time     time.Time `json:"time"`
+	Provider string    `json:"provider"`
+	// Source is empty for calls the proxy observed. Events imported from other
+	// tools (e.g. "claude-code") carry their origin and have no latency data.
+	Source    string  `json:"source,omitempty"`
+	Path      string  `json:"path"`
+	Status    int     `json:"status"`
+	Streaming bool    `json:"streaming"`
+	TTFBMs    float64 `json:"ttfb_ms"`
+	TotalMs   float64 `json:"total_ms"`
 	usage.Usage
 	HasUsage bool `json:"has_usage"`
 }
@@ -49,6 +52,10 @@ type Rotation struct {
 // DefaultRotation keeps about 200 MB at most: the active file plus three
 // rotated ones of 50 MB each.
 var DefaultRotation = Rotation{MaxBytes: 50 << 20, Keep: 3}
+
+// HasLatency reports whether TTFBMs/TotalMs are real measurements. Only calls
+// that went through the proxy have them.
+func (e Event) HasLatency() bool { return e.Source == "" }
 
 // Logger appends events to a JSONL file, rotating it by size. It is safe for
 // concurrent use by one process; run a single proxy per log file.

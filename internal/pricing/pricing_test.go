@@ -274,3 +274,31 @@ func TestUpdateWritesAtomicallyAndKeepsOldTableOnFailure(t *testing.T) {
 		t.Fatalf("temp files left behind: %v", left)
 	}
 }
+
+// Validated against Claude Code's own cost-state: claude-haiku-4-5 with 131747
+// input and 3435 output tokens plus 4 web searches recorded costUSD 0.188922.
+func TestWebSearchIsBilledPerQuery(t *testing.T) {
+	tb, err := Reduce([]byte(`{"claude-haiku-4-5-20251001":{"litellm_provider":"anthropic","mode":"chat",
+		"input_cost_per_token":1e-6,"output_cost_per_token":5e-6,
+		"search_context_cost_per_query":{"search_context_size_high":0.01,"search_context_size_low":0.01,"search_context_size_medium":0.01}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := tb.CostOf("anthropic", usage.Usage{Model: "claude-haiku-4-5-20251001", InputTokens: 131747, OutputTokens: 3435, WebSearchRequests: 4})
+	if !ok {
+		t.Fatal("not found")
+	}
+	near(t, got, 0.188922)
+}
+
+func TestSearchPricePicksMediumElseCheapest(t *testing.T) {
+	if p := searchPrice(map[string]any{"search_context_cost_per_query": map[string]any{"search_context_size_low": 0.03, "search_context_size_medium": 0.05, "search_context_size_high": 0.08}}); p == nil || *p != 0.05 {
+		t.Fatalf("medium: %v", p)
+	}
+	if p := searchPrice(map[string]any{"search_context_cost_per_query": map[string]any{"search_context_size_high": 0.08, "search_context_size_low": 0.03}}); p == nil || *p != 0.03 {
+		t.Fatalf("cheapest: %v", p)
+	}
+	if searchPrice(map[string]any{}) != nil || searchPrice(map[string]any{"search_context_cost_per_query": "x"}) != nil {
+		t.Fatal("absent or malformed must be nil")
+	}
+}

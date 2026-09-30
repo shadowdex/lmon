@@ -28,6 +28,9 @@ type Row struct {
 	P50TotalMs   float64 `json:"p50_total_ms"`
 	P95TotalMs   float64 `json:"p95_total_ms"`
 	AvgTTFBMs    float64 `json:"avg_ttfb_ms"`
+	// LatencyCalls is how many calls the latency figures are based on. Events
+	// imported from other tools have none, so this can be less than Calls (or 0).
+	LatencyCalls int `json:"latency_calls"`
 
 	// Estimated cost at standard rates; zero unless a price table was given.
 	CostUSD     float64 `json:"cost_usd"`
@@ -120,8 +123,11 @@ func AggregateWithPrices(events []proxy.Event, tbl *pricing.Table) []Row {
 		} else if billable {
 			a.UnpricedCalls++
 		}
-		a.totals = append(a.totals, e.TotalMs)
-		a.ttfbs = append(a.ttfbs, e.TTFBMs)
+		if e.HasLatency() {
+			a.LatencyCalls++
+			a.totals = append(a.totals, e.TotalMs)
+			a.ttfbs = append(a.ttfbs, e.TTFBMs)
+		}
 	}
 	rows := make([]Row, 0, len(m))
 	for _, a := range m {
@@ -197,4 +203,25 @@ func LoadFiles(paths []string, since time.Time) ([]proxy.Event, error) {
 		all = append(all, evs...)
 	}
 	return all, nil
+}
+
+// Merge combines proxy-observed events with events imported from another tool.
+// When both saw the same call (same non-empty response ID, e.g. Claude Code
+// run through the proxy) the proxy's copy wins because it has latency, and the
+// imported one is dropped so the call is counted once.
+func Merge(observed, imported []proxy.Event) []proxy.Event {
+	seen := make(map[string]bool, len(observed))
+	for _, e := range observed {
+		if e.ID != "" {
+			seen[e.ID] = true
+		}
+	}
+	out := append([]proxy.Event(nil), observed...)
+	for _, e := range imported {
+		if e.ID != "" && seen[e.ID] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }

@@ -25,6 +25,7 @@ import (
 // Rates are USD per token with every field resolved (no missing values).
 type Rates struct {
 	Input, Output, CacheRead, CacheWrite, CacheWrite1h float64
+	WebSearch                                          float64 // per query
 }
 
 // A field that is nil means "not listed" so it can fall back (see resolve).
@@ -45,6 +46,9 @@ type Tier struct {
 
 type Entry struct {
 	Provider string `json:"provider"`
+	// WebSearch is USD per server-side web search query, when the provider
+	// bills it separately (Anthropic: $0.01).
+	WebSearch *float64 `json:"web_search,omitempty"`
 	partial
 	Tiers []Tier `json:"tiers,omitempty"` // ascending by Above
 }
@@ -86,6 +90,7 @@ func (e Entry) Rates(totalInput int) Rates {
 	r.CacheRead = deref(p.CacheRead, r.Input)
 	r.CacheWrite = deref(p.CacheWrite, r.Input)
 	r.CacheWrite1h = deref(p.CacheWrite1h, r.CacheWrite)
+	r.WebSearch = deref(e.WebSearch, 0)
 	return r
 }
 
@@ -100,7 +105,8 @@ func Cost(u usage.Usage, r Rates) float64 {
 		float64(u.OutputTokens)*r.Output +
 		float64(u.CacheReadTokens)*r.CacheRead +
 		float64(w5m)*r.CacheWrite +
-		float64(w1h)*r.CacheWrite1h
+		float64(w1h)*r.CacheWrite1h +
+		float64(u.WebSearchRequests)*r.WebSearch
 }
 
 // Table is a loaded price list.

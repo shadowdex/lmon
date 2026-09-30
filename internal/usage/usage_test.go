@@ -71,3 +71,17 @@ func TestAnthropicCacheWrite1hBreakdown(t *testing.T) {
 		t.Fatalf("no breakdown: %+v", u)
 	}
 }
+
+func TestAnthropicIDAndWebSearches(t *testing.T) {
+	body := []byte(`{"id":"msg_abc","model":"m","usage":{"input_tokens":1,"output_tokens":2,"server_tool_use":{"web_search_requests":3}}}`)
+	u, ok := Anthropic{}.ParseJSON(body)
+	if !ok || u.ID != "msg_abc" || u.WebSearchRequests != 3 {
+		t.Fatalf("json: %+v", u)
+	}
+	sse := []byte("data: " + `{"type":"message_start","message":{"id":"msg_s","model":"m","usage":{"input_tokens":1}}}` + "\n\n" +
+		"data: " + `{"type":"message_delta","usage":{"output_tokens":9,"server_tool_use":{"web_search_requests":2}}}` + "\n\n")
+	u, ok = Anthropic{}.ParseSSE(sse)
+	if !ok || u.ID != "msg_s" || u.WebSearchRequests != 2 || u.OutputTokens != 9 {
+		t.Fatalf("sse: %+v", u)
+	}
+}

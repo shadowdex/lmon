@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -49,5 +50,37 @@ func TestAggregateWithoutTableHasNoCost(t *testing.T) {
 	rows := Aggregate([]proxy.Event{call("gpt-x", 200, true, 100, 100)})
 	if rows[0].CostUSD != 0 || rows[0].PricedCalls != 0 || rows[0].UnpricedCalls != 0 || rows[0].CostLabel() != "-" {
 		t.Fatalf("%+v", rows[0])
+	}
+}
+
+func TestLatencyIgnoresImportedEvents(t *testing.T) {
+	proxied := proxy.Event{Time: time.Now(), Provider: "anthropic", Status: 200, TotalMs: 1000, TTFBMs: 200, HasUsage: true, Usage: usage.Usage{Model: "m", InputTokens: 1}}
+	imported := proxy.Event{Time: time.Now(), Provider: "anthropic", Source: "claude-code", Status: 200, HasUsage: true, Usage: usage.Usage{Model: "m", InputTokens: 1}}
+	rows := Aggregate([]proxy.Event{proxied, imported, imported})
+	r := rows[0]
+	if r.Calls != 3 || r.LatencyCalls != 1 || r.AvgTotalMs != 1000 || r.P50TotalMs != 1000 || r.AvgTTFBMs != 200 {
+		t.Fatalf("zeros from imported events leaked into latency: %+v", r)
+	}
+	only := Aggregate([]proxy.Event{imported})[0]
+	if only.LatencyCalls != 0 || only.AvgTotalMs != 0 {
+		t.Fatalf("%+v", only)
+	}
+}
+
+func TestMergePrefersProxyCopyAndKeepsUnmatched(t *testing.T) {
+	mk := func(id, src string) proxy.Event {
+		return proxy.Event{Source: src, Usage: usage.Usage{ID: id, Model: "m"}}
+	}
+	got := Merge(
+		[]proxy.Event{mk("msg_1", ""), mk("", "")},
+		[]proxy.Event{mk("msg_1", "claude-code"), mk("msg_2", "claude-code"), mk("", "claude-code")},
+	)
+	var ids []string
+	for _, e := range got {
+		ids = append(ids, e.ID+"/"+e.Source)
+	}
+	want := "msg_1/ / msg_2/claude-code /claude-code"
+	if strings.Join(ids, " ") != want {
+		t.Fatalf("got %q want %q", strings.Join(ids, " "), want)
 	}
 }
