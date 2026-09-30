@@ -18,6 +18,14 @@ archives:
 checksum:
   name_template: checksums.txt # install.sh verifies downloads against this
 
+git:
+  # A stable release's notes should cover everything since the previous *stable*
+  # release, not just since the last pre-release (v0.2.0's notes would otherwise
+  # be only the commits after v0.2.0-rc1). The release workflow sets IGNORE_TAG
+  # to "*-*" when the tag being released is stable, and to "" for a pre-release.
+  ignore_tags:
+    - '{{ if index .Env "IGNORE_TAG" }}{{ .Env.IGNORE_TAG }}{{ end }}'
+
 changelog:
   abbrev: 7 # short hashes; entries stay in git-log order (newest first)
   filters:

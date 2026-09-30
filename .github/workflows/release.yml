@@ -18,6 +18,13 @@ jobs:
         with: { go-version-file: go.mod }
       # Never publish a build that fails its own tests.
       - run: go vet ./... && go test -race ./...
+      # Stable tags (no hyphen) compare against the previous stable tag; see .goreleaser.yaml.
+      - name: Choose which tags the changelog may compare against
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *-*) echo "IGNORE_TAG=" >> "$GITHUB_ENV" ;;
+            *)   echo "IGNORE_TAG=*-*" >> "$GITHUB_ENV" ;;
+          esac
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
