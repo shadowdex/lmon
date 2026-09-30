@@ -9,12 +9,28 @@ SRV=""
 cleanup() { if [ -n "$SRV" ]; then kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; fi; rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# On GitHub Actions, "::error::" lines become check-run annotations, which can be
+# read through the API without a login: failures stay diagnosable without the raw log.
+annotate() { # LEVEL MESSAGE...
+  [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+  local level=$1; shift
+  local msg=$*
+  msg=${msg//'%'/'%25'}; msg=${msg//$'\r'/'%0D'}; msg=${msg//$'\n'/'%0A'}
+  echo "::$level title=install tests::${msg:0:1500}"
+}
+fatal() { echo "FATAL: $*"; annotate error "FATAL: $*"; exit 2; }
+
 pass=0; fail=0
 ok()  { pass=$((pass + 1)); echo "  ok    $1"; }
-bad() { fail=$((fail + 1)); echo "  FAIL  $1"; [ -n "${2:-}" ] && echo "$2" | sed 's/^/          /'; }
+bad() {
+  fail=$((fail + 1)); echo "  FAIL  $1"
+  [ -n "${2:-}" ] && echo "$2" | sed 's/^/          /'
+  annotate error "FAIL: $1${2:+ :: $2}"
+}
+annotate notice "env: bash $BASH_VERSION | $(python3 --version 2>&1) | $(go version 2>&1) | $(uname -srm) | $(curl --version 2>&1 | head -1)"
 
-case "$(uname -s)" in Linux) OS=linux ;; Darwin) OS=darwin ;; *) echo "unsupported host"; exit 2 ;; esac
-case "$(uname -m)" in x86_64|amd64) ARCH=amd64 ;; arm64|aarch64) ARCH=arm64 ;; *) echo "unsupported host"; exit 2 ;; esac
+case "$(uname -s)" in Linux) OS=linux ;; Darwin) OS=darwin ;; *) fatal "unsupported host OS $(uname -s)" ;; esac
+case "$(uname -m)" in x86_64|amd64) ARCH=amd64 ;; arm64|aarch64) ARCH=arm64 ;; *) fatal "unsupported host arch $(uname -m)" ;; esac
 
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 
@@ -22,7 +38,8 @@ sha() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1
 release() {
   local ver=$2 d="$WORK/rel/$1" b="$WORK/build-$2"
   mkdir -p "$d" "$b"
-  (cd "$ROOT" && CGO_ENABLED=0 go build -ldflags "-X main.version=$ver -X main.commit=fake123" -o "$b/lmon" .) || { echo "build failed"; exit 2; }
+  local out
+  out=$(cd "$ROOT" && CGO_ENABLED=0 go build -ldflags "-X main.version=$ver -X main.commit=fake123" -o "$b/lmon" . 2>&1) || fatal "go build failed: $out"
   cp "$ROOT/LICENSE" "$b/"
   local a="lmon_${ver}_${OS}_${ARCH}.tar.gz"
   tar -czf "$d/$a" -C "$b" lmon LICENSE
@@ -43,10 +60,10 @@ mkdir -p "$WORK/rel/v5.5.5"
 cp "$WORK/rel/v9.9.9/lmon_9.9.9_${OS}_${ARCH}.tar.gz" "$WORK/rel/v5.5.5/lmon_5.5.5_${OS}_${ARCH}.tar.gz"
 echo "0000  some_other_file.tar.gz" > "$WORK/rel/v5.5.5/checksums.txt"
 
-python3 "$ROOT/scripts/fake-release-server.py" "$WORK/rel" "$WORK/port" &
+python3 "$ROOT/scripts/fake-release-server.py" "$WORK/rel" "$WORK/port" 2>"$WORK/server.err" &
 SRV=$!
-for _ in $(seq 1 50); do [ -s "$WORK/port" ] && break; sleep 0.1; done
-[ -s "$WORK/port" ] || { echo "fake server did not start"; exit 2; }
+for _ in $(seq 1 100); do [ -s "$WORK/port" ] && break; sleep 0.1; done
+[ -s "$WORK/port" ] || fatal "fake server did not start within 10s: $(cat "$WORK/server.err" 2>&1)"
 BASE="http://127.0.0.1:$(cat "$WORK/port")"
 mkdir -p "$WORK/home"
 
