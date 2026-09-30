@@ -31,7 +31,8 @@ var (
 const usageText = `lmon - LLM usage, latency and endpoint monitor
 
 Usage:
-  lmon proxy [--port 8787] [--log PATH]   run the local recording proxy
+  lmon proxy [--port 8787] [--log PATH] [--max-size-mb 50] [--keep 3]
+                                          run the local recording proxy (rotates its log by size)
   lmon stats [--since 24h] [--json]       summarize recorded calls
   lmon top [--window 15m] [--log PATH]    live terminal view (keys: w window, s sort, p pause, q quit)
   lmon probe <host> [--geoip FILE] [--json]
@@ -82,12 +83,18 @@ func runProxy(args []string) error {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	port := fs.Int("port", 8787, "listen port")
 	logPath := fs.String("log", proxy.DefaultLogPath(), "event log (JSONL)")
+	maxMB := fs.Int("max-size-mb", int(proxy.DefaultRotation.MaxBytes>>20), "rotate the log at this size in MB (0 = never rotate)")
+	keep := fs.Int("keep", proxy.DefaultRotation.Keep, "rotated log files to keep")
 	fs.Parse(args)
+	if *maxMB < 0 || *keep < 0 {
+		return fmt.Errorf("--max-size-mb and --keep must not be negative")
+	}
 
-	lg, err := proxy.NewLogger(*logPath)
+	lg, err := proxy.NewRotatingLogger(*logPath, proxy.Rotation{MaxBytes: int64(*maxMB) << 20, Keep: *keep})
 	if err != nil {
 		return err
 	}
+	lg.OnError = func(err error) { fmt.Fprintln(os.Stderr, "lmon: log:", err) }
 	defer lg.Close()
 
 	// Bind to loopback only: the proxy forwards your API keys.
@@ -114,19 +121,15 @@ func runStats(args []string) error {
 	asJSON := fs.Bool("json", false, "JSON output")
 	fs.Parse(args)
 
-	f, err := os.Open(*logPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("no events yet at %s; run `lmon proxy` and send some requests", *logPath)
-		}
-		return err
+	files := proxy.LogFiles(*logPath)
+	if len(files) == 0 {
+		return fmt.Errorf("no events yet at %s; run `lmon proxy` and send some requests", *logPath)
 	}
-	defer f.Close()
 	var cutoff time.Time
 	if *since > 0 {
 		cutoff = time.Now().Add(-*since)
 	}
-	events, err := stats.Load(f, cutoff)
+	events, err := stats.LoadFiles(files, cutoff)
 	if err != nil {
 		return err
 	}

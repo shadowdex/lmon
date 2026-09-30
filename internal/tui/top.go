@@ -57,6 +57,17 @@ func New(logPath string, window time.Duration) *Model {
 			break
 		}
 	}
+	// Seed from rotated files (everything but the active log) so a window that
+	// spans a rotation isn't cut short; the tailer then follows the active file.
+	var older []string
+	for _, f := range proxy.LogFiles(logPath) {
+		if f != logPath {
+			older = append(older, f)
+		}
+	}
+	if evs, err := stats.LoadFiles(older, m.now().Add(-retention)); err == nil {
+		m.events = evs
+	}
 	m.poll()
 	return m
 }

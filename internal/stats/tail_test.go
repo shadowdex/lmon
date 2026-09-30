@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func appendFile(t *testing.T, p, s string) {
@@ -73,5 +74,67 @@ func TestTailerSkipsGarbageAndBoundsInitialRead(t *testing.T) {
 	evs, _ := tl.Poll()
 	if len(evs) != 1 || evs[0].Model != "tail" {
 		t.Fatalf("got %d events, first=%+v", len(evs), evs)
+	}
+}
+
+func TestTailerReadsUnseenTailOfRotatedFileWithoutLossOrDuplicates(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "e.jsonl")
+	tl := &Tailer{Path: p}
+	appendFile(t, p, line("a")+line("b"))
+	if evs, _ := tl.Poll(); len(evs) != 2 {
+		t.Fatalf("setup: %d", len(evs))
+	}
+	appendFile(t, p, line("c")+line("d"))        // written, but not yet polled...
+	if err := os.Rename(p, p+".1"); err != nil { // ...when the logger rotates
+		t.Fatal(err)
+	}
+	appendFile(t, p, line("e"))
+
+	evs, _ := tl.Poll()
+	var got []string
+	for _, e := range evs {
+		got = append(got, e.Model)
+	}
+	if strings.Join(got, "") != "cde" {
+		t.Fatalf("got %v, want [c d e] (c,d from the rotated file, e from the new one)", got)
+	}
+	appendFile(t, p, line("f"))
+	if evs, _ := tl.Poll(); len(evs) != 1 || evs[0].Model != "f" {
+		t.Fatalf("after rotation got %+v", evs)
+	}
+}
+
+func TestTailerReplacedFileWithoutRotatedCopyJustRestarts(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "e.jsonl")
+	tl := &Tailer{Path: p}
+	appendFile(t, p, line("a"))
+	tl.Poll()
+	os.Remove(p)
+	appendFile(t, p, line("z"))
+	if evs, _ := tl.Poll(); len(evs) != 1 || evs[0].Model != "z" {
+		t.Fatalf("got %+v", evs)
+	}
+}
+
+func TestLoadFilesSkipsFilesOlderThanCutoffAndKeepsOrder(t *testing.T) {
+	dir := t.TempDir()
+	old, cur := filepath.Join(dir, "e.jsonl.1"), filepath.Join(dir, "e.jsonl")
+	os.WriteFile(old, []byte(line("old")), 0o644)
+	os.WriteFile(cur, []byte(line("cur")), 0o644)
+	past := time.Now().Add(-48 * time.Hour)
+	os.Chtimes(old, past, past)
+
+	evs, err := LoadFiles([]string{old, cur, filepath.Join(dir, "gone")}, time.Time{})
+	if err != nil || len(evs) != 2 || evs[0].Model != "old" || evs[1].Model != "cur" {
+		t.Fatalf("all: %+v %v", evs, err)
+	}
+	// line() events are stamped 2026-01-01, so use a cutoff on the file mtime only:
+	evs, _ = LoadFiles([]string{old, cur}, time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	if len(evs) != 2 {
+		t.Fatalf("old cutoff should keep both, got %d", len(evs))
+	}
+	evs, _ = LoadFiles([]string{old}, time.Now().Add(-24*time.Hour))
+	if len(evs) != 0 {
+		t.Fatalf("file last written 48h ago must be skipped, got %d", len(evs))
 	}
 }

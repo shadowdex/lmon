@@ -16,6 +16,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,9 +38,31 @@ type Event struct {
 	HasUsage bool `json:"has_usage"`
 }
 
+// Rotation controls size-based log rotation. When the active file would grow
+// past MaxBytes it becomes <path>.1 (older files shift up to <path>.Keep, and
+// the oldest is deleted). MaxBytes <= 0 disables rotation.
+type Rotation struct {
+	MaxBytes int64
+	Keep     int
+}
+
+// DefaultRotation keeps about 200 MB at most: the active file plus three
+// rotated ones of 50 MB each.
+var DefaultRotation = Rotation{MaxBytes: 50 << 20, Keep: 3}
+
+// Logger appends events to a JSONL file, rotating it by size. It is safe for
+// concurrent use by one process; run a single proxy per log file.
 type Logger struct {
-	mu sync.Mutex
-	f  *os.File
+	// OnError, if set, is called for write and rotation failures. Events are
+	// never dropped because rotation failed: the logger keeps appending.
+	OnError func(error)
+
+	mu      sync.Mutex
+	f       *os.File
+	path    string
+	rot     Rotation
+	size    int64
+	retryAt int64 // don't retry a failed rotation until size reaches this
 }
 
 // DefaultLogPath is ~/.lmon/events.jsonl.
@@ -47,25 +71,137 @@ func DefaultLogPath() string {
 	return filepath.Join(home, ".lmon", "events.jsonl")
 }
 
-func NewLogger(path string) (*Logger, error) {
+func NewLogger(path string) (*Logger, error) { return NewRotatingLogger(path, DefaultRotation) }
+
+func NewRotatingLogger(path string, rot Rotation) (*Logger, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
+	l := &Logger{path: path, rot: rot}
+	if err := l.open(); err != nil {
 		return nil, err
 	}
-	return &Logger{f: f}, nil
+	return l, nil
+}
+
+func (l *Logger) open() error {
+	f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+	l.f, l.size = f, st.Size()
+	return nil
+}
+
+func (l *Logger) report(err error) {
+	if l.OnError != nil {
+		l.OnError(err)
+	}
 }
 
 func (l *Logger) Write(e Event) {
 	b, _ := json.Marshal(e)
+	b = append(b, '\n')
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.f.Write(append(b, '\n'))
+	if l.f == nil { // a previous rotation couldn't reopen the file
+		if err := l.open(); err != nil {
+			l.report(fmt.Errorf("event dropped, cannot open log: %w", err))
+			return
+		}
+	}
+	if l.rot.MaxBytes > 0 && l.size > 0 && l.size+int64(len(b)) > l.rot.MaxBytes && l.size >= l.retryAt {
+		l.rotate()
+		if l.f == nil {
+			l.report(fmt.Errorf("event dropped, cannot reopen log after rotation"))
+			return
+		}
+	}
+	n, err := l.f.Write(b)
+	l.size += int64(n)
+	if err != nil {
+		l.report(err)
+	}
 }
 
-func (l *Logger) Close() error { return l.f.Close() }
+// rotate must be called with l.mu held. The file is closed first because
+// Windows can't rename an open file. If the rename fails we reopen the same
+// file and keep appending, retrying after another 1 MiB.
+func (l *Logger) rotate() {
+	l.f.Close()
+	l.f = nil
+	shiftErr := l.shift()
+	if err := l.open(); err != nil {
+		l.report(err)
+		return
+	}
+	if shiftErr != nil {
+		l.retryAt = l.size + 1<<20
+		l.report(fmt.Errorf("log rotation failed, continuing to append: %w", shiftErr))
+		return
+	}
+	l.retryAt = 0
+}
+
+func (l *Logger) shift() error {
+	if l.rot.Keep <= 0 {
+		return os.Remove(l.path)
+	}
+	name := func(i int) string { return fmt.Sprintf("%s.%d", l.path, i) }
+	if err := os.Remove(name(l.rot.Keep)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for i := l.rot.Keep - 1; i >= 1; i-- {
+		if err := os.Rename(name(i), name(i+1)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return os.Rename(l.path, name(1))
+}
+
+func (l *Logger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.f == nil {
+		return nil
+	}
+	return l.f.Close()
+}
+
+// LogFiles returns the active log and its rotated files, oldest first
+// (<path>.N ... <path>.1, <path>). Only files that exist are returned.
+func LogFiles(path string) []string {
+	entries, _ := os.ReadDir(filepath.Dir(path))
+	base := filepath.Base(path)
+	type rotated struct {
+		n    int
+		name string
+	}
+	var rot []rotated
+	for _, e := range entries {
+		suffix, ok := strings.CutPrefix(e.Name(), base+".")
+		if !ok || e.IsDir() {
+			continue
+		}
+		if n, err := strconv.Atoi(suffix); err == nil && n > 0 {
+			rot = append(rot, rotated{n, filepath.Join(filepath.Dir(path), e.Name())})
+		}
+	}
+	sort.Slice(rot, func(i, j int) bool { return rot[i].n > rot[j].n })
+	var out []string
+	for _, r := range rot {
+		out = append(out, r.name)
+	}
+	if _, err := os.Stat(path); err == nil {
+		out = append(out, path)
+	}
+	return out
+}
 
 // Handler returns the proxy handler. upstreams overrides a provider's default
 // upstream URL (used in tests).

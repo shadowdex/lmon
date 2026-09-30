@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"io"
+	"os"
 	"sort"
 	"time"
 
@@ -124,3 +125,30 @@ func pct(v []float64, p float64) float64 {
 
 // Percentile is the nearest-rank percentile (p in 0-100) of v.
 func Percentile(v []float64, p float64) float64 { return pct(v, p) }
+
+// LoadFiles reads several JSONL logs (oldest first, as returned by
+// proxy.LogFiles). A file whose last write is before since can't contain
+// qualifying events, so it is skipped without being read.
+func LoadFiles(paths []string, since time.Time) ([]proxy.Event, error) {
+	var all []proxy.Event
+	for _, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // rotated away between listing and opening
+			}
+			return nil, err
+		}
+		if st, err := f.Stat(); err == nil && !since.IsZero() && st.ModTime().Before(since) {
+			f.Close()
+			continue
+		}
+		evs, err := Load(f, since)
+		f.Close()
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, evs...)
+	}
+	return all, nil
+}

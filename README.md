@@ -21,6 +21,9 @@ Providers: anthropic, openai, xai, groq, mistral, deepseek, openrouter
 - `lmon top` tails the same log (5m/15m/1h/24h windows, per-model latency trend). It needs a
   terminal and drops columns on narrow ones; honors `NO_COLOR`.
 - Events are appended to `~/.lmon/events.jsonl`. Prompts and responses are never stored.
+  The log rotates by size (`lmon proxy --max-size-mb 50 --keep 3`, about 200 MB at most;
+  `--max-size-mb 0` disables it). `stats` and `top` read the rotated files too. Run one
+  proxy per log file.
 - Cache hit rate = cache-read tokens / total input tokens. `input_tokens` is always
   uncached input; OpenAI's cached tokens are subtracted out to match Anthropic.
 - OpenAI chat streaming only reports usage if the request sets
