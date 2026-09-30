@@ -12,10 +12,14 @@ import (
 	"text/tabwriter"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/term"
+
 	"github.com/shadowdex/lmon/internal/geoip"
 	"github.com/shadowdex/lmon/internal/probe"
 	"github.com/shadowdex/lmon/internal/proxy"
 	"github.com/shadowdex/lmon/internal/stats"
+	"github.com/shadowdex/lmon/internal/tui"
 )
 
 // Set by GoReleaser via -ldflags.
@@ -29,6 +33,7 @@ const usageText = `lmon - LLM usage, latency and endpoint monitor
 Usage:
   lmon proxy [--port 8787] [--log PATH]   run the local recording proxy
   lmon stats [--since 24h] [--json]       summarize recorded calls
+  lmon top [--window 15m] [--log PATH]    live terminal view (keys: w window, s sort, p pause, q quit)
   lmon probe <host> [--geoip FILE] [--json]
                                           DNS, geo and connection timing for an endpoint
   lmon geoip update                       download the free DB-IP city database (~/.lmon)
@@ -55,6 +60,8 @@ func main() {
 		err = runStats(args)
 	case "probe":
 		err = runProbe(args)
+	case "top":
+		err = runTop(args)
 	case "geoip":
 		err = runGeoIP(args)
 	case "version", "--version", "-v":
@@ -225,4 +232,17 @@ func runGeoIP(args []string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown geoip command %q (want update or path)", args[0])
+}
+
+func runTop(args []string) error {
+	fs := flag.NewFlagSet("top", flag.ExitOnError)
+	logPath := fs.String("log", proxy.DefaultLogPath(), "event log (JSONL)")
+	window := fs.Duration("window", 15*time.Minute, "initial window: rounds up to 5m, 15m, 1h or 24h")
+	fs.Parse(args)
+
+	if !term.IsTerminal(os.Stdout.Fd()) {
+		return fmt.Errorf("top needs an interactive terminal; use `lmon stats` for piped output")
+	}
+	_, err := tea.NewProgram(tui.New(*logPath, *window)).Run()
+	return err
 }

@@ -121,3 +121,6 @@ func pct(v []float64, p float64) float64 {
 	}
 	return s[i]
 }
+
+// Percentile is the nearest-rank percentile (p in 0-100) of v.
+func Percentile(v []float64, p float64) float64 { return pct(v, p) }

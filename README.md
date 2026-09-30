@@ -10,6 +10,7 @@ export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
 export OPENAI_BASE_URL=http://localhost:8787/openai/v1
 
 lmon stats --since 24h          # tokens, cache hit rate, latency (avg/p50/p95/TTFB)
+lmon top                        # live view: w window, s sort, p pause, q quit
 lmon geoip update               # one-time: download the free DB-IP city database
 lmon probe api.anthropic.com    # DNS per resolver, IP geo, TCP/TLS/TTFB timing
 ```
@@ -17,6 +18,8 @@ lmon probe api.anthropic.com    # DNS per resolver, IP geo, TCP/TLS/TTFB timing
 Providers: anthropic, openai, xai, groq, mistral, deepseek, openrouter
 (`/<provider>/...`). Add one in `internal/usage/usage.go`.
 
+- `lmon top` tails the same log (5m/15m/1h/24h windows, per-model latency trend). It needs a
+  terminal and drops columns on narrow ones; honors `NO_COLOR`.
 - Events are appended to `~/.lmon/events.jsonl`. Prompts and responses are never stored.
 - Cache hit rate = cache-read tokens / total input tokens. `input_tokens` is always
   uncached input; OpenAI's cached tokens are subtracted out to match Anthropic.
