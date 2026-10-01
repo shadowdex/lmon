@@ -39,6 +39,9 @@ type reqKey struct {
 type tokKey struct {
 	provider, model, typ string
 }
+type byteKey struct {
+	provider, model, dir string
+}
 
 type hist struct {
 	counts []uint64 // per bucket, not cumulative; last slot is +Inf
@@ -71,6 +74,7 @@ type Registry struct {
 	models   map[mKey]bool
 	requests map[reqKey]uint64
 	tokens   map[tokKey]uint64
+	bytes    map[byteKey]uint64
 	search   map[mKey]uint64
 	cost     map[mKey]float64
 	unpriced map[mKey]uint64
@@ -85,7 +89,7 @@ func New(version string, prices func() *pricing.Table) *Registry {
 	return &Registry{
 		version: version, prices: prices,
 		models:   map[mKey]bool{},
-		requests: map[reqKey]uint64{}, tokens: map[tokKey]uint64{}, search: map[mKey]uint64{},
+		requests: map[reqKey]uint64{}, tokens: map[tokKey]uint64{}, bytes: map[byteKey]uint64{}, search: map[mKey]uint64{},
 		cost: map[mKey]float64{}, unpriced: map[mKey]uint64{},
 		dur: map[mKey]*hist{}, ttfb: map[mKey]*hist{},
 		probes: map[string]ProbeSample{},
@@ -139,6 +143,12 @@ func (r *Registry) Observe(e proxy.Event) {
 			}
 			h.observe(e.TTFBMs / 1000)
 		}
+	}
+	if e.BytesUp > 0 {
+		r.bytes[byteKey{k.provider, k.model, "up"}] += uint64(e.BytesUp)
+	}
+	if e.BytesDown > 0 {
+		r.bytes[byteKey{k.provider, k.model, "down"}] += uint64(e.BytesDown)
 	}
 	if e.HasUsage {
 		add := func(typ string, n int) {
@@ -276,6 +286,12 @@ func (r *Registry) Write(w io.Writer) {
 		toks.add("", lbl("model", k.model, "provider", k.provider, "type", k.typ), strconv.FormatUint(n, 10))
 	}
 	toks.write(w)
+
+	byt := &family{name: "lmon_bytes_total", help: "Payload bytes through the proxy: up is the request sent to the provider, down the response (after decompression). Excludes headers and TLS overhead.", typ: "counter"}
+	for k, n := range r.bytes {
+		byt.add("", lbl("direction", k.dir, "model", k.model, "provider", k.provider), strconv.FormatUint(n, 10))
+	}
+	byt.write(w)
 
 	srch := &family{name: "lmon_web_search_requests_total", help: "Server-side web search queries.", typ: "counter"}
 	for k, n := range r.search {

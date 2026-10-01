@@ -85,3 +85,26 @@ func TestAnthropicIDAndWebSearches(t *testing.T) {
 		t.Fatalf("sse: %+v", u)
 	}
 }
+
+func TestUpstreamHostAndProviderHosts(t *testing.T) {
+	for prov, want := range map[string]string{
+		"anthropic": "api.anthropic.com", "openai": "api.openai.com", "xai": "api.x.ai",
+		"groq":       "api.groq.com", // its upstream has a path (/openai); only the host counts
+		"openrouter": "openrouter.ai", "nope": "",
+	} {
+		if got := UpstreamHost(prov); got != want {
+			t.Errorf("UpstreamHost(%q) = %q, want %q", prov, got, want)
+		}
+	}
+	hosts := ProviderHosts()
+	if len(hosts) != len(Registry) {
+		t.Fatalf("one distinct host per provider expected: %v", hosts)
+	}
+	seen := map[string]bool{}
+	for _, h := range hosts {
+		if h == "" || seen[h] {
+			t.Fatalf("empty or duplicate host in %v", hosts)
+		}
+		seen[h] = true
+	}
+}
