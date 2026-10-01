@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -19,11 +21,13 @@ import (
 	"github.com/shadowdex/lmon/internal/claudecode"
 	"github.com/shadowdex/lmon/internal/geoip"
 	"github.com/shadowdex/lmon/internal/metrics"
+	"github.com/shadowdex/lmon/internal/netpath"
 	"github.com/shadowdex/lmon/internal/pricing"
 	"github.com/shadowdex/lmon/internal/probe"
 	"github.com/shadowdex/lmon/internal/proxy"
 	"github.com/shadowdex/lmon/internal/stats"
 	"github.com/shadowdex/lmon/internal/tui"
+	"github.com/shadowdex/lmon/internal/usage"
 )
 
 // Set by GoReleaser via -ldflags.
@@ -38,13 +42,17 @@ Usage:
   lmon proxy [--port 8787] [--log PATH] [--max-size-mb 50] [--keep 3] [--probe-host H] [--metrics-addr :9464]
                                           run the local recording proxy (rotates its log by size;
                                           Prometheus metrics at /metrics)
-  lmon stats [--since 24h] [--json] [--claude]
-                                          summarize recorded calls (--claude adds Claude Code sessions)
+  lmon stats [--since 24h] [--json] [--claude] [--by-country]
+                                          summarize recorded calls (--claude adds Claude Code sessions;
+                                          --by-country breaks them down by country)
   lmon top [--window 15m] [--claude]      live terminal view (keys: w window, s sort, p pause, q quit)
   lmon probe <host> [--geoip FILE] [--json]
                                           DNS, geo and connection timing for an endpoint
   lmon prices update                      download model prices (enables cost estimates)
   lmon prices show <provider> <model>     show the rates lmon would use for a model
+  lmon path [host...] [--html map.html] [-v] [--json]
+                                          which countries the route to an endpoint crosses
+                                          (default: every provider endpoint lmon knows)
   lmon geoip update                       download the free DB-IP city database (~/.lmon)
   lmon geoip path                         print the database path in use
   lmon version
@@ -75,6 +83,8 @@ func main() {
 		err = runGeoIP(args)
 	case "prices":
 		err = runPrices(args)
+	case "path":
+		err = runPath(args)
 	case "version", "--version", "-v":
 		v, c := versionInfo()
 		fmt.Printf("lmon %s (%s)\n", v, c)
@@ -99,12 +109,16 @@ func runProxy(args []string) error {
 	metricsAddr := fs.String("metrics-addr", "", "also serve /metrics on this separate address, e.g. 0.0.0.0:9464 so a Prometheus in Docker can scrape it (metrics hold no API keys, but do show models and usage)")
 	probeHosts := fs.String("probe-host", "", "comma-separated hosts to probe in the background for /metrics (e.g. api.anthropic.com); makes outbound HTTPS requests")
 	probeEvery := fs.Duration("probe-every", time.Minute, "how often to probe --probe-host hosts")
+	pathEvery := fs.Duration("path-every", 0, "re-trace the route to each provider you have used, this often (e.g. 1h), so `lmon top` and `lmon stats --by-country` stay current; 0 = off. Sends traceroute probes.")
 	fs.Parse(args)
 	if *maxMB < 0 || *keep < 0 {
 		return fmt.Errorf("--max-size-mb and --keep must not be negative")
 	}
 	if *probeEvery < 10*time.Second {
 		return fmt.Errorf("--probe-every must be at least 10s")
+	}
+	if *pathEvery != 0 && *pathEvery < 5*time.Minute {
+		return fmt.Errorf("--path-every must be at least 5m (or 0 to turn it off)")
 	}
 	var hosts []string
 	for _, h := range strings.Split(*probeHosts, ",") {
@@ -124,12 +138,20 @@ func runProxy(args []string) error {
 	prices := &pricing.Reloader{Path: pricing.DefaultPath()}
 	v, _ := versionInfo()
 	reg := metrics.New(v, prices.Get)
-	lg.OnEvent = reg.Observe
+	seen := &seenProviders{}
+	lg.OnEvent = func(e proxy.Event) {
+		reg.Observe(e)
+		seen.add(e.Provider)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if len(hosts) > 0 {
 		go reg.RunProbes(ctx, hosts, *probeEvery, func() string { return geoip.Resolve(os.Getenv("LMON_GEOIP_DB")) }, 10*time.Second)
+	}
+
+	if *pathEvery > 0 {
+		go refreshPathsLoop(ctx, *pathEvery, seen)
 	}
 
 	api := proxy.Handler(lg, nil)
@@ -179,6 +201,7 @@ func runStats(args []string) error {
 	asJSON := fs.Bool("json", false, "JSON output")
 	withClaude := fs.Bool("claude", false, "also include Claude Code sessions, read from its own logs (no latency data)")
 	claudeDir := fs.String("claude-dir", "", "Claude config dir(s), comma separated (default $CLAUDE_CONFIG_DIR, else ~/.claude)")
+	byCountry := fs.Bool("by-country", false, "break traffic down by the countries on each provider's path (run `lmon path` first)")
 	fs.Parse(args)
 
 	files := proxy.LogFiles(*logPath)
@@ -203,6 +226,10 @@ func runStats(args []string) error {
 		}
 		events = stats.Merge(events, sc.All())
 	}
+	paths := loadPaths()
+	if *byCountry {
+		return printByCountry(os.Stdout, stats.ByCountry(events, paths), len(paths) > 0, *asJSON, time.Now())
+	}
 	tbl := loadPrices()
 	rows := stats.AggregateWithPrices(events, tbl)
 	if *asJSON {
@@ -217,7 +244,11 @@ func runStats(args []string) error {
 	if tbl != nil {
 		costHdr = "\tCOST"
 	}
-	fmt.Fprintln(tw, "PROVIDER\tMODEL\tCALLS\tERR\tINPUT\tOUTPUT\tCACHE-R\tCACHE-W\tHIT%\tAVG\tP50\tP95\tTTFB"+costHdr)
+	entersHdr := ""
+	if len(paths) > 0 {
+		entersHdr = "\tENTERS" // where traffic enters the provider; from `lmon path`
+	}
+	fmt.Fprintln(tw, "PROVIDER\tMODEL\tCALLS\tERR\tINPUT\tOUTPUT\tCACHE-R\tCACHE-W\tHIT%\tAVG\tP50\tP95\tTTFB"+costHdr+entersHdr)
 	var total float64
 	var anyUnpriced bool
 	for _, r := range rows {
@@ -233,9 +264,13 @@ func runStats(args []string) error {
 			}
 			return fmt.Sprintf("%.0fms", v)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%.0f%%\t%s\t%s\t%s\t%s%s\n",
+		enters := ""
+		if len(paths) > 0 {
+			enters = "\t" + entersOf(paths, r.Provider)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%.0f%%\t%s\t%s\t%s\t%s%s%s\n",
 			r.Provider, r.Model, r.Calls, r.Errors, r.Input, r.Output, r.CacheRead, r.CacheWrite,
-			r.CacheHitRate*100, ms(r.AvgTotalMs), ms(r.P50TotalMs), ms(r.P95TotalMs), ms(r.AvgTTFBMs), cost)
+			r.CacheHitRate*100, ms(r.AvgTotalMs), ms(r.P50TotalMs), ms(r.P95TotalMs), ms(r.AvgTTFBMs), cost, enters)
 	}
 	if err := tw.Flush(); err != nil {
 		return err
@@ -372,7 +407,7 @@ func runTop(args []string) error {
 			return err
 		}
 	}
-	_, err := tea.NewProgram(tui.New(*logPath, *window, loadPrices(), sc)).Run()
+	_, err := tea.NewProgram(tui.New(*logPath, *window, loadPrices(), sc, loadPathsQuiet)).Run()
 	return err
 }
 
@@ -443,4 +478,221 @@ func claudeScanner(dirs string, since time.Time) (*claudecode.Scanner, error) {
 		return nil, fmt.Errorf("no Claude Code logs found (looked for a projects/ dir in $CLAUDE_CONFIG_DIR, ~/.claude, ~/.config/claude); use --claude-dir")
 	}
 	return &claudecode.Scanner{Roots: found, Since: since}, nil
+}
+
+func parseFrom(s string) (*netpath.Point, error) {
+	var lat, lon float64
+	if _, err := fmt.Sscanf(strings.ReplaceAll(s, " ", ""), "%f,%f", &lat, &lon); err != nil || lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+		return nil, fmt.Errorf("--from wants LAT,LON such as 48.85,2.35, got %q", s)
+	}
+	return &netpath.Point{Lat: lat, Lon: lon, Label: fmt.Sprintf("%.2f, %.2f", lat, lon), Source: "given"}, nil
+}
+
+func runPath(args []string) error {
+	fs := flag.NewFlagSet("path", flag.ExitOnError)
+	v4 := fs.Bool("4", false, "trace the IPv4 address")
+	v6 := fs.Bool("6", false, "trace the IPv6 address")
+	asJSON := fs.Bool("json", false, "JSON output")
+	verbose := fs.Bool("v", false, "show every hop")
+	htmlOut := fs.String("html", "", "also write a self-contained HTML page with a world map to this file")
+	noSave := fs.Bool("no-save", false, "don't save a summary for `lmon top` and `lmon stats --by-country`")
+	from := fs.String("from", os.Getenv("LMON_FROM"), "your location as LAT,LON, e.g. 43.60,1.44 (default $LMON_FROM, else estimated from your first public router)")
+	geoFlag := fs.String("geoip", os.Getenv("LMON_GEOIP_DB"), "path to a City .mmdb (default: the database from `lmon geoip update`)")
+	noRDNS := fs.Bool("no-rdns", false, "don't look up router hostnames (they make locations more accurate)")
+	maxHops := fs.Int("max-hops", 30, "give up after this many hops")
+	timeout := fs.Duration("timeout", 90*time.Second, "time allowed per endpoint")
+	parallel := fs.Int("parallel", 3, "endpoints to trace at once")
+
+	// Allow flags before and after host names.
+	var hosts []string
+	for {
+		fs.Parse(args)
+		args = fs.Args()
+		if len(args) == 0 {
+			break
+		}
+		h := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(args[0], "https://"), "http://"), "/")
+		hosts = append(hosts, h)
+		args = args[1:]
+	}
+	if *v4 && *v6 {
+		return fmt.Errorf("-4 and -6 are mutually exclusive")
+	}
+	family := 0
+	if *v4 {
+		family = 4
+	} else if *v6 {
+		family = 6
+	}
+	if len(hosts) == 0 {
+		hosts = usage.ProviderHosts()
+	}
+	var vantage *netpath.Point
+	if *from != "" {
+		var err error
+		if vantage, err = parseFrom(*from); err != nil {
+			return err
+		}
+	}
+
+	var geo netpath.Locator
+	attribution := ""
+	if path := geoip.Resolve(*geoFlag); path != "" {
+		if path == geoip.DefaultPath() {
+			attribution = geoip.Attribution
+		}
+		db, err := geoip.Open(path)
+		if err != nil {
+			return fmt.Errorf("opening GeoIP database %s: %w", path, err)
+		}
+		defer db.Close()
+		geo = db
+	} else {
+		fmt.Fprintln(os.Stderr, "lmon: no GeoIP database, so locations come only from router hostnames. Run `lmon geoip update` for much better results.")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	results := make([]netpath.Path, len(hosts))
+	errs := make([]error, len(hosts))
+	sem := make(chan struct{}, max(1, *parallel))
+	var wg sync.WaitGroup
+	for i, h := range hosts {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, h string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			fmt.Fprintf(os.Stderr, "tracing %s ...\n", h)
+			hctx, cancel := context.WithTimeout(ctx, *timeout)
+			defer cancel()
+			results[i], errs[i] = netpath.Run(hctx, h, netpath.Options{
+				Family: family, Runner: netpath.Runner{MaxHops: *maxHops},
+				Geo: geo, NoRDNS: *noRDNS, Vantage: vantage,
+			})
+		}(i, h)
+	}
+	wg.Wait()
+
+	var paths []netpath.Path
+	reported := map[string]bool{}
+	for i := range hosts {
+		if errs[i] != nil {
+			msg := errs[i].Error()
+			var nt netpath.ErrNoTraceroute
+			if errors.As(errs[i], &nt) {
+				msg = nt.Error() // the same for every host: say it once
+			}
+			if !reported[msg] {
+				reported[msg] = true
+				fmt.Fprintln(os.Stderr, "lmon:", msg)
+			}
+			continue
+		}
+		paths = append(paths, results[i])
+	}
+	if len(paths) == 0 {
+		return fmt.Errorf("no endpoint could be traced")
+	}
+	if vantage == nil {
+		labels := map[string]bool{}
+		for _, p := range paths {
+			if p.Vantage != nil {
+				labels[p.Vantage.Label] = true
+			}
+		}
+		if len(labels) > 1 {
+			fmt.Fprintln(os.Stderr, "lmon: note: your location was estimated differently for different endpoints (IPv4 and IPv6 routers geolocate differently). Set it once with --from LAT,LON or $LMON_FROM for consistent results.")
+		}
+	}
+
+	if !*noSave {
+		store := netpath.Store{Path: netpath.DefaultStorePath()}
+		now := time.Now()
+		var sums []netpath.Summary
+		for _, p := range paths {
+			sums = append(sums, p.Summary(now))
+		}
+		if err := store.Save(sums...); err != nil {
+			fmt.Fprintln(os.Stderr, "lmon: could not save path summaries:", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "saved %d path summaries to %s (used by `lmon top` and `lmon stats --by-country`)\n", len(sums), store.Path)
+		}
+	}
+	if *htmlOut != "" {
+		f, err := os.Create(*htmlOut)
+		if err != nil {
+			return err
+		}
+		werr := netpath.WriteHTML(f, paths, attribution)
+		if cerr := f.Close(); werr == nil {
+			werr = cerr
+		}
+		if werr != nil {
+			return fmt.Errorf("writing %s: %w", *htmlOut, werr)
+		}
+		fmt.Fprintf(os.Stderr, "wrote %s (open it in a browser)\n", *htmlOut)
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(paths)
+	}
+	fmt.Print(netpath.RenderText(paths, *verbose))
+	if attribution != "" {
+		fmt.Println("\n" + attribution)
+	}
+	return nil
+}
+
+// refreshPathsLoop re-traces the route to every provider that has had traffic,
+// once a minute after start (to catch the first ones) and then every interval.
+func refreshPathsLoop(ctx context.Context, every time.Duration, seen *seenProviders) {
+	run := func() {
+		hosts := seen.hosts()
+		if len(hosts) == 0 {
+			return
+		}
+		var geo netpath.Locator
+		if path := geoip.Resolve(os.Getenv("LMON_GEOIP_DB")); path != "" {
+			if db, err := geoip.Open(path); err == nil {
+				defer db.Close()
+				geo = db
+			}
+		}
+		var vantage *netpath.Point
+		if from := os.Getenv("LMON_FROM"); from != "" {
+			vantage, _ = parseFrom(from)
+		}
+		_, errs := netpath.Refresh(ctx, hosts, netpath.Options{Geo: geo, Vantage: vantage},
+			netpath.Store{Path: netpath.DefaultStorePath()}, 90*time.Second, nil)
+		for _, err := range errs {
+			fmt.Fprintln(os.Stderr, "lmon: path refresh:", err)
+		}
+	}
+	first := time.NewTimer(time.Minute)
+	defer first.Stop()
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-first.C:
+			run()
+		case <-tick.C:
+			run()
+		}
+	}
+}
+
+// loadPathsQuiet is loadPaths for the live view: errors must not scribble over
+// the screen, so an unreadable file just means no route information.
+func loadPathsQuiet() map[string]netpath.Summary {
+	paths, err := netpath.Store{Path: netpath.DefaultStorePath()}.Load()
+	if err != nil {
+		return nil
+	}
+	return paths
 }
