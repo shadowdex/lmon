@@ -28,6 +28,11 @@ type Row struct {
 	P50TotalMs   float64 `json:"p50_total_ms"`
 	P95TotalMs   float64 `json:"p95_total_ms"`
 	AvgTTFBMs    float64 `json:"avg_ttfb_ms"`
+	// BytesUp/BytesDown are request/response payload bytes seen by the proxy, over
+	// the ByteCalls calls that have them (Claude Code sessions have none).
+	BytesUp   int64 `json:"bytes_up"`
+	BytesDown int64 `json:"bytes_down"`
+	ByteCalls int   `json:"byte_calls"`
 	// LatencyCalls is how many calls the latency figures are based on. Events
 	// imported from other tools have none, so this can be less than Calls (or 0).
 	LatencyCalls int `json:"latency_calls"`
@@ -122,6 +127,11 @@ func AggregateWithPrices(events []proxy.Event, tbl *pricing.Table) []Row {
 			a.PricedCalls++
 		} else if billable {
 			a.UnpricedCalls++
+		}
+		if e.HasBytes() {
+			a.BytesUp += e.BytesUp
+			a.BytesDown += e.BytesDown
+			a.ByteCalls++
 		}
 		if e.HasLatency() {
 			a.LatencyCalls++

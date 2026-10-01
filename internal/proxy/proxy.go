@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shadowdex/lmon/internal/usage"
@@ -37,9 +38,18 @@ type Event struct {
 	Streaming bool    `json:"streaming"`
 	TTFBMs    float64 `json:"ttfb_ms"`
 	TotalMs   float64 `json:"total_ms"`
+	// BytesUp and BytesDown are the request and response payload sizes the proxy
+	// saw. They exclude HTTP headers and TLS overhead, and the response is
+	// counted after decompression (what the client receives). Zero for events
+	// that did not pass through the proxy, or were logged before this was recorded.
+	BytesUp   int64 `json:"bytes_up,omitempty"`
+	BytesDown int64 `json:"bytes_down,omitempty"`
 	usage.Usage
 	HasUsage bool `json:"has_usage"`
 }
+
+// HasBytes reports whether the event carries byte counts.
+func (e Event) HasBytes() bool { return e.BytesUp+e.BytesDown > 0 }
 
 // Rotation controls size-based log rotation. When the active file would grow
 // past MaxBytes it becomes <path>.1 (older files shift up to <path>.Keep, and
@@ -240,6 +250,10 @@ func Handler(log *Logger, upstreams map[string]string) http.Handler {
 
 		start := time.Now()
 		var ttfb time.Duration
+		var up atomic.Int64 // request bytes, counted as the transport reads the body
+		if r.Body != nil && r.Body != http.NoBody {
+			r.Body = &countingBody{rc: r.Body, n: &up}
+		}
 		rp := &httputil.ReverseProxy{
 			Rewrite: func(pr *httputil.ProxyRequest) {
 				pr.SetURL(target)
@@ -256,10 +270,11 @@ func Handler(log *Logger, upstreams map[string]string) http.Handler {
 				// Tee the body so usage can be parsed without delaying the client.
 				resp.Body = &teeBody{
 					rc: resp.Body,
-					onEOF: func(body []byte) {
+					onEOF: func(body []byte, total int64) {
 						ev := Event{
 							Time: start, Provider: prov, Path: "/" + rest, Status: resp.StatusCode,
 							TTFBMs: ms(ttfb), TotalMs: ms(time.Since(start)),
+							BytesUp: up.Load(), BytesDown: total,
 						}
 						ct := resp.Header.Get("Content-Type")
 						var u usage.Usage
@@ -277,7 +292,7 @@ func Handler(log *Logger, upstreams map[string]string) http.Handler {
 				return nil
 			},
 			ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-				log.Write(Event{Time: start, Provider: prov, Path: "/" + rest, Status: http.StatusBadGateway, TotalMs: ms(time.Since(start))})
+				log.Write(Event{Time: start, Provider: prov, Path: "/" + rest, Status: http.StatusBadGateway, TotalMs: ms(time.Since(start)), BytesUp: up.Load()})
 				http.Error(w, "lmon: upstream error: "+err.Error(), http.StatusBadGateway)
 			},
 		}
@@ -290,26 +305,43 @@ func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond)
 // maxCapture bounds memory per response kept for usage parsing.
 const maxCapture = 16 << 20
 
-// teeBody passes bytes through untouched while keeping a bounded copy.
+// teeBody passes bytes through untouched while keeping a bounded copy for
+// parsing and counting every byte that passes, however large.
 type teeBody struct {
 	rc    io.ReadCloser
 	buf   bytes.Buffer
+	total int64
 	once  sync.Once
-	onEOF func([]byte)
+	onEOF func(body []byte, total int64)
 }
 
 func (t *teeBody) Read(p []byte) (int, error) {
 	n, err := t.rc.Read(p)
+	t.total += int64(n)
 	if n > 0 && t.buf.Len() < maxCapture {
 		t.buf.Write(p[:n])
 	}
 	if err != nil {
-		t.once.Do(func() { t.onEOF(t.buf.Bytes()) })
+		t.once.Do(func() { t.onEOF(t.buf.Bytes(), t.total) })
 	}
 	return n, err
 }
 
 func (t *teeBody) Close() error {
-	t.once.Do(func() { t.onEOF(t.buf.Bytes()) })
+	t.once.Do(func() { t.onEOF(t.buf.Bytes(), t.total) })
 	return t.rc.Close()
 }
+
+// countingBody counts the bytes read from a request body.
+type countingBody struct {
+	rc io.ReadCloser
+	n  *atomic.Int64
+}
+
+func (c *countingBody) Read(p []byte) (int, error) {
+	n, err := c.rc.Read(p)
+	c.n.Add(int64(n))
+	return n, err
+}
+
+func (c *countingBody) Close() error { return c.rc.Close() }

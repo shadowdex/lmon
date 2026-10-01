@@ -57,6 +57,9 @@ lmon stats --claude             # also count Claude Code sessions (reads its own
 lmon top --claude               # same, live
 lmon prices update              # one-time: download model prices (enables cost estimates)
 lmon prices show anthropic claude-sonnet-5-5   # the rates lmon will use
+lmon path                       # which countries the route to each provider crosses
+lmon stats --by-country         # tokens and bytes per country on each provider's path
+lmon top                        # ...press c for the same as a live dashboard panel
 lmon geoip update               # one-time: download the free DB-IP city database
 lmon probe api.anthropic.com    # DNS per resolver, IP geo, TCP/TLS/TTFB timing
 ```
@@ -101,6 +104,77 @@ Providers: anthropic, openai, xai, groq, mistral, deepseek, openrouter
 - The proxy binds to loopback only because it forwards your API keys.
 - Release: `goreleaser release --clean` (builds macOS/Linux/Windows, amd64/arm64).
 
+## Which countries does the traffic cross?
+
+```bash
+lmon path                       # every provider endpoint lmon knows, side by side
+lmon path api.openai.com -v     # one endpoint, with every hop
+lmon path --html map.html       # also write a self-contained world map (open it in a browser)
+lmon path --from 48.85,2.35     # say where you are (or set $LMON_FROM); -4 / -6 pick the IP version
+```
+
+```
+api.anthropic.com  →  160.79.104.10  (IPv4, reached, 8 hops)
+  viewpoint: Paris, FR (estimated from your first public router; use --from to set it)
+  route:     you → FR Paris → edge
+  countries seen on the path: FR
+  endpoint:  registered in San Francisco, US, but answered from FR Paris (6 ms round trip): an anycast
+             or edge server close to you, not a machine in US
+  beyond the edge: not observable from here (the provider's own network)
+```
+
+It runs the system `traceroute` (`traceroute6` on macOS for IPv6, `tracert` on Windows; on
+Debian/Ubuntu `apt install traceroute`), so no root is needed. Each router is placed from its
+**hostname** (city codes such as `par1`, `cdg15`, `frnkge08`) and from **GeoIP** (run
+`lmon geoip update` first), then checked against its **round-trip time**: a router cannot be
+farther away than light in fibre allows, and a later, faster answer limits every earlier hop.
+The endpoint itself is timed with a real TCP handshake, which is far steadier than a router reply.
+
+**What it cannot tell you.** A traceroute ends where traffic enters the provider's network
+(the *edge*). Where the model actually runs, and every country the request crosses *after* the
+edge, is invisible from outside; only the provider's documentation and regional endpoints can
+answer that. Typical endpoints (Cloudflare or cloud front doors) are **anycast**: the address
+GeoIP calls "San Francisco" answers in 6 ms from Paris because it is a server near you. lmon
+says so instead of drawing a line to San Francisco, and shows the registered place only as
+context (a dashed ring on the map).
+
+**How much to trust a place.** Hostnames are usually right and GeoIP often is not (it places
+routers at their owner's headquarters). A router marked `?` was ruled out by its own timing.
+Your own location is estimated from your first public router unless you pass `--from`; if
+that conflicts with a router whose hostname and GeoIP agree, lmon warns you. Results can differ
+between runs and between IPv4 and IPv6 because the route does. Probes go to the routers along
+the way, and each router's address is looked up in reverse DNS (`--no-rdns` skips that).
+
+### Tokens and bytes by country
+
+```bash
+lmon path                       # measures the routes and saves a summary (~/.lmon/paths.json)
+lmon stats --by-country         # or: lmon top, then press c
+lmon proxy --path-every 1h      # keep the summaries fresh for the providers you actually use
+```
+
+```
+COUNTRY                          CALLS  TOKENS IN  TOKENS OUT  BYTES UP  BYTES DOWN  PROVIDERS
+FR                                 412       9.1M        310k     38 MB      2.1 MB  anthropic, openai
+GB                                  63       1.2M         41k      5 MB      0.3 MB  openai
+beyond the edge: not observable    412       9.1M        310k     38 MB*     2.1 MB* anthropic, openai
+```
+
+`lmon top` shows the same as a panel with gradient bars (key `c`, or `tab`), and the models
+table gets an `ENTERS` column: where each provider's traffic enters its network (`≈` means
+only consistent with the registered place, not proven).
+
+**This is a model, not a measurement.** Tokens and bytes are exact, but the proxy cannot see
+which route each request took. Every call to a provider is counted in every country on that
+provider's most recently measured path (so the rows add up to more than the total), and that
+path only runs up to the provider's edge. The last row is every call: what happens beyond the
+edge is not observable from here. Paths can change between measurements; `top` shows how old they are.
+
+Bytes are request and response payload sizes seen by the proxy (the response after
+decompression; HTTP headers and TLS overhead are not counted). Claude Code sessions have no
+byte counts, so rows that mix them are marked `*`. The saved file holds only a slim summary per
+provider (countries, edge, viewpoint, time), never router addresses.
+
 ## Prometheus
 
 `lmon proxy` serves Prometheus metrics at `http://127.0.0.1:8787/metrics`. To scrape from a
@@ -115,6 +189,7 @@ Add `--probe-host api.anthropic.com,api.openai.com` to probe endpoints in the ba
 | `lmon_tokens_total` | provider, model, type = input, output, cache_read, cache_write |
 | `lmon_cost_usd_total`, `lmon_unpriced_requests_total` | provider, model (needs `lmon prices update`) |
 | `lmon_request_duration_seconds`, `lmon_time_to_first_byte_seconds` (histograms) | provider, model |
+| `lmon_bytes_total` | provider, model, direction = up (request) or down (response) |
 | `lmon_web_search_requests_total`, `lmon_inflight_requests`, `lmon_build_info` | |
 | `lmon_probe_success`, `_http_status`, `_phase_seconds`, `_dns_seconds`, `_dns_success`, `_dns_answers`, `_ip_info`, `_last_run_timestamp_seconds` | host, resolver, phase, ip, country, city |
 
@@ -142,6 +217,7 @@ checked with Prometheus' `promtool check metrics`.
 ## Attribution
 
 IP geolocation by [DB-IP.com](https://db-ip.com) (CC BY 4.0).
+World map outline from [Natural Earth](https://www.naturalearthdata.com) (public domain).
 Model prices from [LiteLLM](https://github.com/BerriAI/litellm)'s community price list (MIT).
 
 ## License

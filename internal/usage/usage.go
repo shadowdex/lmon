@@ -5,6 +5,8 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"net/url"
+	"sort"
 	"strings"
 )
 
@@ -235,4 +237,37 @@ func (o OpenAICompat) ParseSSE(body []byte) (Usage, bool) {
 		}
 	})
 	return last, found
+}
+
+// UpstreamHost is the API host for a provider name, e.g. "api.anthropic.com"
+// for "anthropic", or "" for an unknown provider.
+func UpstreamHost(provider string) string {
+	ad, ok := Registry[provider]
+	if !ok {
+		return ""
+	}
+	u, err := url.Parse(ad.Upstream())
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
+// ProviderHosts lists the distinct API hosts of every known provider, ordered
+// by provider name.
+func ProviderHosts() []string {
+	names := make([]string, 0, len(Registry))
+	for n := range Registry {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var hosts []string
+	seen := map[string]bool{}
+	for _, n := range names {
+		if h := UpstreamHost(n); h != "" && !seen[h] {
+			seen[h] = true
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
 }

@@ -13,7 +13,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/oschwald/maxminddb-golang/v2"
+	"github.com/shadowdex/lmon/internal/geoip"
 )
 
 // DefaultResolvers are queried in addition to the system resolver.
@@ -24,6 +24,7 @@ var DefaultResolvers = map[string]string{
 }
 
 type Geo struct {
+	ISO     string  `json:"iso,omitempty"`
 	Country string  `json:"country,omitempty"`
 	City    string  `json:"city,omitempty"`
 	Lat     float64 `json:"lat,omitempty"`
@@ -105,10 +106,10 @@ func Run(ctx context.Context, host, geoDB string, timeout time.Duration) Result 
 		res.DNS = append(res.DNS, d)
 	}
 
-	var db *maxminddb.Reader
+	var db *geoip.DB
 	if geoDB != "" {
-		if r, err := maxminddb.Open(geoDB); err == nil {
-			db = r
+		if d, err := geoip.Open(geoDB); err == nil {
+			db = d
 			defer db.Close()
 		}
 	}
@@ -133,36 +134,16 @@ func resolverFor(name string) *net.Resolver {
 	}
 }
 
-func lookupGeo(db *maxminddb.Reader, s string) *Geo {
-	if db == nil {
-		return nil
-	}
+func lookupGeo(db *geoip.DB, s string) *Geo {
 	ip, err := netip.ParseAddr(s)
 	if err != nil {
 		return nil
 	}
-	var rec struct {
-		Country struct {
-			ISO   string            `maxminddb:"iso_code"`
-			Names map[string]string `maxminddb:"names"`
-		} `maxminddb:"country"`
-		City struct {
-			Names map[string]string `maxminddb:"names"`
-		} `maxminddb:"city"`
-		Location struct {
-			Lat float64 `maxminddb:"latitude"`
-			Lon float64 `maxminddb:"longitude"`
-		} `maxminddb:"location"`
-	}
-	r := db.Lookup(ip)
-	if !r.Found() || r.Decode(&rec) != nil {
+	loc, ok := db.Lookup(ip)
+	if !ok {
 		return nil
 	}
-	c := rec.Country.Names["en"]
-	if c == "" {
-		c = rec.Country.ISO
-	}
-	return &Geo{Country: c, City: rec.City.Names["en"], Lat: rec.Location.Lat, Lon: rec.Location.Lon}
+	return &Geo{ISO: loc.ISO, Country: loc.Country, City: loc.City, Lat: loc.Lat, Lon: loc.Lon}
 }
 
 // timeRequest does one HTTPS GET / and records per-phase timings.

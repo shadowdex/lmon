@@ -11,6 +11,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/shadowdex/lmon/internal/claudecode"
+	"github.com/shadowdex/lmon/internal/netpath"
 	"github.com/shadowdex/lmon/internal/pricing"
 	"github.com/shadowdex/lmon/internal/proxy"
 	"github.com/shadowdex/lmon/internal/stats"
@@ -51,6 +52,13 @@ type Model struct {
 	claude   *claudecode.Scanner
 	imported map[string]proxy.Event
 
+	// Saved route summaries (from `lmon path`), reloaded now and then. Nil
+	// pathsFn means none: no ENTERS column and an empty Countries panel.
+	pathsFn pathsLoader
+	paths   map[string]netpath.Summary
+	pathsAt time.Time
+
+	view   View
 	window int // index into Windows
 	sortBy int // index into sortKeys
 	paused bool
@@ -59,10 +67,11 @@ type Model struct {
 }
 
 // New creates the model and loads existing history immediately. prices may be
-// nil (costs are not shown) and claude may be nil (proxy events only).
-func New(logPath string, window time.Duration, prices *pricing.Table, claude *claudecode.Scanner) *Model {
+// nil (costs are not shown), claude may be nil (proxy events only) and paths may
+// be nil (no route information).
+func New(logPath string, window time.Duration, prices *pricing.Table, claude *claudecode.Scanner, paths pathsLoader) *Model {
 	m := &Model{tailer: &stats.Tailer{Path: logPath}, now: time.Now, prices: prices,
-		claude: claude, imported: map[string]proxy.Event{}}
+		claude: claude, imported: map[string]proxy.Event{}, pathsFn: paths, paths: map[string]netpath.Summary{}}
 	m.window = len(Windows) - 1
 	for i, w := range Windows {
 		if w >= window {
@@ -86,6 +95,12 @@ func New(logPath string, window time.Duration, prices *pricing.Table, claude *cl
 }
 
 func (m *Model) poll() {
+	if m.pathsFn != nil && (m.pathsAt.IsZero() || m.now().Sub(m.pathsAt) >= 5*time.Second) {
+		if p := m.pathsFn(); p != nil {
+			m.paths = p
+		}
+		m.pathsAt = m.now()
+	}
 	evs, err := m.tailer.Poll()
 	m.err = err
 	m.events = append(m.events, evs...)
@@ -150,6 +165,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sortBy = (m.sortBy + 1) % len(sortKeys)
 		case "p":
 			m.paused = !m.paused
+		case "c", "tab":
+			m.view = (m.view + 1) % 2
 		}
 	}
 	return m, nil
@@ -191,8 +208,21 @@ func (m *Model) Render(width int) string {
 	if m.claude != nil {
 		src = "  + claude-code (approx., no latency)"
 	}
-	b.WriteString(bold.Render("lmon top") + dim.Render(fmt.Sprintf("  window %s  sort %s%s", fmtWindow(win), sortKeys[m.sortBy], src)) + state + "\n")
-	b.WriteString(dim.Render("[w] window  [s] sort  [p] pause  [q] quit") + "\n\n")
+	sortNote := ""
+	if m.view == ViewModels {
+		sortNote = "  sort " + sortKeys[m.sortBy]
+	}
+	fit := lipgloss.NewStyle().Width(width) // wrap, rather than overflow, on narrow terminals
+	b.WriteString(fit.Render(bold.Render("lmon top")+dim.Render(fmt.Sprintf("  %s  window %s%s%s", m.view, fmtWindow(win), sortNote, src))+state) + "\n")
+	other := ViewCountries
+	if m.view == ViewCountries {
+		other = ViewModels
+	}
+	keys := fmt.Sprintf("[c] %s  [w] window  ", other)
+	if m.view == ViewModels {
+		keys += "[s] sort  "
+	}
+	b.WriteString(fit.Render(dim.Render(keys+"[p] pause  [q] quit")) + "\n\n")
 
 	if m.err != nil {
 		b.WriteString(red.Render("error reading log: "+m.err.Error()) + "\n\n")
@@ -203,8 +233,12 @@ func (m *Model) Render(width int) string {
 		return b.String()
 	}
 
-	b.WriteString(summary(in, now, win, m.prices) + "\n")
+	b.WriteString(fit.Render(summary(in, now, win, m.prices)) + "\n")
 	b.WriteString(dim.Render("activity ") + cyan.Render(sparkline(bucketCounts(in, now, win, 40))) + "\n\n")
+	if m.view == ViewCountries {
+		b.WriteString(m.renderCountries(in, now, win, width))
+		return b.String()
+	}
 	b.WriteString(m.table(in, now, win, width))
 	return b.String()
 }
@@ -322,12 +356,22 @@ func (m *Model) table(in []proxy.Event, now time.Time, win time.Duration, width 
 		{"P50", 7, false, 4, func(r rowData, w int) string { return latCell(r, r.P50TotalMs, w) }},
 		{"P95", 7, false, 0, func(r rowData, w int) string { return latCell(r, r.P95TotalMs, w) }},
 		{"TTFB", 7, false, 9, func(r rowData, w int) string { return latCell(r, r.AvgTTFBMs, w) }},
-		{"TREND", trendCells, true, 10, func(r rowData, w int) string { return cyan.Render(pad(sparkline(r.trend), w, true)) }},
+		{"ENTERS", 13, true, 10, func(r rowData, w int) string { return pad(ellipsize(m.enters(r.Provider), w), w, true) }},
+		{"TREND", trendCells, true, 11, func(r rowData, w int) string { return cyan.Render(pad(sparkline(r.trend), w, true)) }},
 	}
 
 	if m.prices == nil {
 		for i, c := range cols {
 			if c.title == "COST" {
+				cols = append(cols[:i], cols[i+1:]...)
+				break
+			}
+		}
+	}
+
+	if len(m.paths) == 0 {
+		for i, c := range cols {
+			if c.title == "ENTERS" {
 				cols = append(cols[:i], cols[i+1:]...)
 				break
 			}

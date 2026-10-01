@@ -147,7 +147,7 @@ func TestPollReadsLogAndPrunesOldEvents(t *testing.T) {
 	lg.Write(ev(time.Minute, "anthropic", "fresh", 200, 1, usage.Usage{}))
 	lg.Close()
 
-	m := New(p, 15*time.Minute, nil, nil)
+	m := New(p, 15*time.Minute, nil, nil, nil)
 	m.now = func() time.Time { return t0 }
 	m.poll()
 	if len(m.events) != 1 || m.events[0].Model != "fresh" {
@@ -160,7 +160,7 @@ func TestNewPicksSmallestWindowAtLeastRequested(t *testing.T) {
 		in   time.Duration
 		want int
 	}{{time.Minute, 0}, {15 * time.Minute, 1}, {20 * time.Minute, 2}, {999 * time.Hour, 3}} {
-		if m := New(filepath.Join(t.TempDir(), "x"), c.in, nil, nil); m.window != c.want {
+		if m := New(filepath.Join(t.TempDir(), "x"), c.in, nil, nil, nil); m.window != c.want {
 			t.Errorf("window(%s) = %d, want %d", c.in, m.window, c.want)
 		}
 	}

@@ -370,3 +370,21 @@ func TestDumpForPromtool(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestBytesCountersByDirection(t *testing.T) {
+	r := metrics.New("v", nil)
+	e := event("claude-x", 200, 100, 50, usage.Usage{InputTokens: 1}, true)
+	e.BytesUp, e.BytesDown = 1200, 34000
+	r.Observe(e)
+	r.Observe(e)
+	r.Observe(event("claude-x", 200, 100, 50, usage.Usage{InputTokens: 1}, true)) // no byte data: adds nothing
+	out := scrape(r)
+	near(t, value(t, out, `lmon_bytes_total{direction="up",model="claude-x",provider="anthropic"}`), 2400)
+	near(t, value(t, out, `lmon_bytes_total{direction="down",model="claude-x",provider="anthropic"}`), 68000)
+
+	none := metrics.New("v", nil)
+	none.Observe(event("claude-x", 200, 100, 50, usage.Usage{InputTokens: 1}, true))
+	if strings.Contains(scrape(none), "lmon_bytes_total") {
+		t.Error("no byte series without byte data")
+	}
+}
