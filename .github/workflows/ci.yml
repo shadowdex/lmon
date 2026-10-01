@@ -14,7 +14,19 @@ jobs:
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
       - run: go vet ./...
-      - run: go test -race ./...
+      - name: go test
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race ./... 2>&1 | tee test.log
+      # A job's log needs a login to read, but annotations do not: say what failed.
+      - name: Report failing tests
+        if: failure()
+        shell: bash
+        run: |
+          [ -f test.log ] || exit 0
+          msg=$(grep -E '^(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+' test.log | head -40 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=go test failures::${msg}"
   cross-compile:
     runs-on: ubuntu-latest
     steps:

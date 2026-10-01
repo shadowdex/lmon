@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -66,8 +67,9 @@ func TestStoreMissingFileIsEmptyAndSaveMergesByHost(t *testing.T) {
 	if len(got) != 2 || got["a.test"].EdgeKind != "unknown" || got["b.test"].Host != "b.test" {
 		t.Fatalf("%+v", got)
 	}
-	info, _ := os.Stat(st.Path)
-	if info.Mode().Perm() != 0o600 {
+	// Windows has no Unix permission bits (Go reports 0666 there), so the privacy
+	// of the file can only be checked where modes exist.
+	if info, _ := os.Stat(st.Path); runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Errorf("the file should be private, got %v", info.Mode().Perm())
 	}
 	if left, _ := filepath.Glob(filepath.Join(filepath.Dir(st.Path), ".paths-*.tmp")); len(left) != 0 {
