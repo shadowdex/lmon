@@ -145,3 +145,18 @@ func TestMeasureConnectBestOfSeveralAndZeroOnFailure(t *testing.T) {
 		t.Fatalf("a cancelled context gives 0, got %v", ms)
 	}
 }
+
+// Found on Windows CI: a fast successful connect measured as 0 ms and was thrown away.
+func TestConnectMsIsNeverZeroForASuccessfulConnect(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Millisecond, 100 * time.Nanosecond} {
+		if got := connectMs(d); got <= 0 {
+			t.Errorf("connectMs(%v) = %v, must stay positive", d, got)
+		}
+	}
+	if got := connectMs(5 * time.Millisecond); got != 5 {
+		t.Errorf("real timings pass through unchanged, got %v", got)
+	}
+	if got := connectMs(1500 * time.Microsecond); got != 1.5 {
+		t.Errorf("got %v", got)
+	}
+}

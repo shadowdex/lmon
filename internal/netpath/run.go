@@ -62,6 +62,17 @@ func MeasureConnect(ctx context.Context, dest netip.Addr) float64 {
 	return measureConnect(ctx, netip.AddrPortFrom(dest, 443), 3)
 }
 
+// connectMs converts the time a successful connect took to milliseconds. It is
+// never zero: Windows' clock is coarse enough that a fast loopback connect can
+// measure as 0, and 0 would be mistaken for "no measurement".
+func connectMs(d time.Duration) float64 {
+	ms := float64(d) / float64(time.Millisecond)
+	if ms < 0.01 {
+		return 0.01
+	}
+	return ms
+}
+
 func measureConnect(ctx context.Context, ap netip.AddrPort, tries int) float64 {
 	best := 0.0
 	for i := 0; i < tries; i++ {
@@ -71,7 +82,7 @@ func measureConnect(ctx context.Context, ap netip.AddrPort, tries int) float64 {
 		if err != nil {
 			continue
 		}
-		ms := float64(time.Since(start)) / float64(time.Millisecond)
+		ms := connectMs(time.Since(start))
 		conn.Close()
 		if best == 0 || ms < best {
 			best = ms
