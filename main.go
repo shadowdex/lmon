@@ -19,6 +19,7 @@ import (
 	"github.com/charmbracelet/x/term"
 
 	"github.com/shadowdex/lmon/internal/claudecode"
+	"github.com/shadowdex/lmon/internal/codex"
 	"github.com/shadowdex/lmon/internal/geoip"
 	"github.com/shadowdex/lmon/internal/metrics"
 	"github.com/shadowdex/lmon/internal/netpath"
@@ -42,10 +43,10 @@ Usage:
   lmon proxy [--port 8787] [--log PATH] [--max-size-mb 50] [--keep 3] [--probe-host H] [--metrics-addr :9464]
                                           run the local recording proxy (rotates its log by size;
                                           Prometheus metrics at /metrics)
-  lmon stats [--since 24h] [--json] [--claude] [--by-country]
-                                          summarize recorded calls (--claude adds Claude Code sessions;
+  lmon stats [--since 24h] [--json] [--claude] [--codex] [--by-country]
+                                          summarize recorded calls (--claude / --codex add those tools' sessions;
                                           --by-country breaks them down by country)
-  lmon top [--window 15m] [--claude]      live terminal view (keys: w window, s sort, p pause, q quit)
+  lmon top [--window 15m] [--claude] [--codex]  live terminal view (keys: w window, s sort, p pause, q quit)
   lmon probe <host> [--geoip FILE] [--json]
                                           DNS, geo and connection timing for an endpoint
   lmon prices update                      download model prices (enables cost estimates)
@@ -201,12 +202,13 @@ func runStats(args []string) error {
 	asJSON := fs.Bool("json", false, "JSON output")
 	withClaude := fs.Bool("claude", false, "also include Claude Code sessions, read from its own logs (no latency data)")
 	claudeDir := fs.String("claude-dir", "", "Claude config dir(s), comma separated (default $CLAUDE_CONFIG_DIR, else ~/.claude)")
+	withCodex := fs.Bool("codex", false, "also include Codex sessions, read from its own logs (no latency data)")
 	byCountry := fs.Bool("by-country", false, "break traffic down by the countries on each provider's path (run `lmon path` first)")
 	fs.Parse(args)
 
 	files := proxy.LogFiles(*logPath)
-	if len(files) == 0 && !*withClaude {
-		return fmt.Errorf("no events yet at %s; run `lmon proxy` and send some requests (or add --claude)", *logPath)
+	if len(files) == 0 && !*withClaude && !*withCodex {
+		return fmt.Errorf("no events yet at %s; run `lmon proxy` and send some requests (or add --claude or --codex)", *logPath)
 	}
 	var cutoff time.Time
 	if *since > 0 {
@@ -223,6 +225,16 @@ func runStats(args []string) error {
 		}
 		if _, err := sc.Poll(); err != nil {
 			fmt.Fprintln(os.Stderr, "lmon: claude logs:", err)
+		}
+		events = stats.Merge(events, sc.All())
+	}
+	if *withCodex {
+		sc, err := codexScanner(cutoff)
+		if err != nil {
+			return err
+		}
+		if _, err := sc.Poll(); err != nil {
+			fmt.Fprintln(os.Stderr, "lmon: codex logs:", err)
 		}
 		events = stats.Merge(events, sc.All())
 	}
@@ -277,6 +289,9 @@ func runStats(args []string) error {
 	}
 	if *withClaude {
 		fmt.Fprintln(os.Stderr, "\nnote: Claude Code rows come from its session logs, which omit some billed calls, so they are approximate and usually slightly low; they also have no latency (-)")
+	}
+	if *withCodex {
+		fmt.Fprintln(os.Stderr, "\nnote: Codex rows come from its session logs, so they have no latency (-); cost is the API list price, not what a ChatGPT plan charges")
 	}
 	switch {
 	case tbl == nil:
@@ -395,19 +410,33 @@ func runTop(args []string) error {
 	window := fs.Duration("window", 15*time.Minute, "initial window: rounds up to 5m, 15m, 1h or 24h")
 	withClaude := fs.Bool("claude", false, "also include Claude Code sessions, read live from its own logs")
 	claudeDir := fs.String("claude-dir", "", "Claude config dir(s), comma separated (default $CLAUDE_CONFIG_DIR, else ~/.claude)")
+	withCodex := fs.Bool("codex", false, "also include Codex sessions, read live from its own logs")
 	fs.Parse(args)
 
 	if !term.IsTerminal(os.Stdout.Fd()) {
 		return fmt.Errorf("top needs an interactive terminal; use `lmon stats` for piped output")
 	}
-	var sc *claudecode.Scanner
-	if *withClaude {
-		var err error
-		if sc, err = claudeScanner(*claudeDir, time.Now().Add(-tui.Retention())); err != nil {
-			return err
+	var imp tui.Importer
+	since := time.Now().Add(-tui.Retention())
+	if *withClaude || *withCodex {
+		var multi multiImport
+		if *withClaude {
+			sc, err := claudeScanner(*claudeDir, since)
+			if err != nil {
+				return err
+			}
+			multi = append(multi, namedScanner{sc, claudecode.Source})
 		}
+		if *withCodex {
+			sc, err := codexScanner(since)
+			if err != nil {
+				return err
+			}
+			multi = append(multi, namedScanner{sc, codex.Source})
+		}
+		imp = multi
 	}
-	_, err := tea.NewProgram(tui.New(*logPath, *window, loadPrices(), sc, loadPathsQuiet)).Run()
+	_, err := tea.NewProgram(tui.New(*logPath, *window, loadPrices(), imp, loadPathsQuiet)).Run()
 	return err
 }
 
@@ -478,6 +507,45 @@ func claudeScanner(dirs string, since time.Time) (*claudecode.Scanner, error) {
 		return nil, fmt.Errorf("no Claude Code logs found (looked for a projects/ dir in $CLAUDE_CONFIG_DIR, ~/.claude, ~/.config/claude); use --claude-dir")
 	}
 	return &claudecode.Scanner{Roots: found, Since: since}, nil
+}
+
+// codexScanner builds a scanner over Codex's session logs ($CODEX_HOME or ~/.codex).
+func codexScanner(since time.Time) (*codex.Scanner, error) {
+	roots := codex.DefaultRoots()
+	if len(roots) == 0 {
+		return nil, fmt.Errorf("no Codex logs found (looked for a sessions/ dir in $CODEX_HOME, ~/.codex)")
+	}
+	return &codex.Scanner{Roots: roots, Since: since}, nil
+}
+
+// namedScanner is a log-reading scanner plus its source name.
+type namedScanner struct {
+	poller interface{ Poll() ([]proxy.Event, error) }
+	name   string
+}
+
+// multiImport polls several log-reading scanners as one tui.Importer.
+type multiImport []namedScanner
+
+func (m multiImport) Poll() ([]proxy.Event, error) {
+	var out []proxy.Event
+	var firstErr error
+	for _, s := range m {
+		evs, err := s.poller.Poll()
+		out = append(out, evs...)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return out, firstErr
+}
+
+func (m multiImport) Label() string {
+	names := make([]string, len(m))
+	for i, s := range m {
+		names[i] = s.name
+	}
+	return strings.Join(names, ", ")
 }
 
 func parseFrom(s string) (*netpath.Point, error) {
