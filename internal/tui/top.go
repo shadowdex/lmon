@@ -10,7 +10,6 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/shadowdex/lmon/internal/claudecode"
 	"github.com/shadowdex/lmon/internal/netpath"
 	"github.com/shadowdex/lmon/internal/pricing"
 	"github.com/shadowdex/lmon/internal/proxy"
@@ -47,9 +46,10 @@ type Model struct {
 	now    func() time.Time
 	prices *pricing.Table // nil = no cost column
 
-	// Optional Claude Code source. Responses are upserted by ID because a
-	// response's output_tokens keeps growing while it streams.
-	claude   *claudecode.Scanner
+	// Optional sources read from other tools' own logs (Claude Code, Codex).
+	// Responses are upserted by ID because a response's output_tokens keeps
+	// growing while it streams.
+	claude   Importer
 	imported map[string]proxy.Event
 
 	// Saved route summaries (from `lmon path`), reloaded now and then. Nil
@@ -69,7 +69,7 @@ type Model struct {
 // New creates the model and loads existing history immediately. prices may be
 // nil (costs are not shown), claude may be nil (proxy events only) and paths may
 // be nil (no route information).
-func New(logPath string, window time.Duration, prices *pricing.Table, claude *claudecode.Scanner, paths pathsLoader) *Model {
+func New(logPath string, window time.Duration, prices *pricing.Table, claude Importer, paths pathsLoader) *Model {
 	m := &Model{tailer: &stats.Tailer{Path: logPath}, now: time.Now, prices: prices,
 		claude: claude, imported: map[string]proxy.Event{}, pathsFn: paths, paths: map[string]netpath.Summary{}}
 	m.window = len(Windows) - 1
@@ -125,6 +125,12 @@ func (m *Model) poll() {
 			}
 		}
 	}
+}
+
+// Importer yields calls recorded by other tools' own logs rather than the proxy.
+type Importer interface {
+	Poll() ([]proxy.Event, error)
+	Label() string // shown in the header, e.g. "claude-code, codex"
 }
 
 // all is every event to show: proxy-observed ones plus Claude Code's, with a
@@ -206,7 +212,7 @@ func (m *Model) Render(width int) string {
 	}
 	src := ""
 	if m.claude != nil {
-		src = "  + claude-code (approx., no latency)"
+		src = "  + " + m.claude.Label() + " (approx., no latency)"
 	}
 	sortNote := ""
 	if m.view == ViewModels {

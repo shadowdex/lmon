@@ -55,6 +55,8 @@ lmon stats --since 24h          # tokens, cache hit rate, latency (avg/p50/p95/T
 lmon top                        # live view: w window, s sort, p pause, q quit
 lmon stats --claude             # also count Claude Code sessions (reads its own logs)
 lmon top --claude               # same, live
+lmon stats --codex              # also count Codex sessions (reads ~/.codex/sessions)
+lmon top --claude --codex       # both, live
 lmon prices update              # one-time: download model prices (enables cost estimates)
 lmon prices show anthropic claude-sonnet-5-5   # the rates lmon will use
 lmon path                       # which countries the route to each provider crosses
@@ -89,6 +91,11 @@ Providers: anthropic, openai, xai, groq, mistral, deepseek, openrouter
   55 sessions of one user, the logs accounted for 93% of the cost (per session: 69% to 106%,
   median 91%). The per-response token counts and prices matched exactly where the logs were
   complete; I could not tell why some billed usage is missing from the logs.
+- **Codex sessions** (`--codex`) are read from its session logs (`$CODEX_HOME`, else
+  `~/.codex/sessions`), which is the way to monitor Codex signed in with ChatGPT: that traffic
+  can't go through the proxy, because Codex requires an HTTPS origin for its backend. Only
+  usage numbers, model, response id and timestamp are read. Calls show up as provider `openai`
+  with no latency, and their cost is the API list price, not what a ChatGPT plan charges.
 - Events are appended to `~/.lmon/events.jsonl`. Prompts and responses are never stored.
   The log rotates by size (`lmon proxy --max-size-mb 50 --keep 3`, about 200 MB at most;
   `--max-size-mb 0` disables it). `stats` and `top` read the rotated files too. Run one

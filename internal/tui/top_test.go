@@ -147,8 +147,14 @@ func TestPollReadsLogAndPrunesOldEvents(t *testing.T) {
 	lg.Write(ev(time.Minute, "anthropic", "fresh", 200, 1, usage.Usage{}))
 	lg.Close()
 
-	m := New(p, 15*time.Minute, nil, nil, nil)
-	m.now = func() time.Time { return t0 }
+	// Not New(): it polls with the real clock, which would prune events dated
+	// around t0 before the test's clock is set.
+	m := &Model{
+		tailer:   &stats.Tailer{Path: p},
+		now:      func() time.Time { return t0 },
+		window:   1,
+		imported: map[string]proxy.Event{},
+	}
 	m.poll()
 	if len(m.events) != 1 || m.events[0].Model != "fresh" {
 		t.Fatalf("events = %+v", m.events)
@@ -261,6 +267,11 @@ func claudeLine(id string, at time.Time, in, out int) string {
 	return string(b) + "\n"
 }
 
+// labeledScanner adapts a Claude scanner to the Importer interface.
+type labeledScanner struct{ *claudecode.Scanner }
+
+func (labeledScanner) Label() string { return "claude-code" }
+
 func claudeModel(t *testing.T, lines ...string) (*Model, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -271,7 +282,7 @@ func claudeModel(t *testing.T, lines ...string) (*Model, string) {
 		tailer:   &stats.Tailer{Path: filepath.Join(root, "no-proxy-log.jsonl")},
 		now:      func() time.Time { return t0 },
 		window:   1,
-		claude:   &claudecode.Scanner{Roots: []string{root}},
+		claude:   labeledScanner{&claudecode.Scanner{Roots: []string{root}}},
 		imported: map[string]proxy.Event{},
 	}
 	m.poll()
